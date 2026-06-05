@@ -1876,7 +1876,9 @@ where
     /// Fetch the next message from the stream.
     ///
     /// Returns `Ok(Some(msg))` for each message, `Ok(None)` when the stream
-    /// ends, or `Err(...)` on protocol/decode/deadline errors.
+    /// ends, or `Err(...)` on protocol/decode/deadline errors. A gRPC or
+    /// gRPC-Web stream that ends without a `grpc-status` trailer (a truncated
+    /// response) is one such `Err`, not a clean `Ok(None)`.
     ///
     /// If a deadline was set on this call (via [`CallOptions::with_timeout`]
     /// or [`ClientConfig::with_default_timeout`]), each `message()` poll is
@@ -1924,6 +1926,10 @@ where
                         }
                         self.trailers = Some(trailers);
                     }
+                    // A parsed trailer frame must still carry grpc-status;
+                    // one that doesn't (or failed to parse) is a malformed
+                    // terminus, not a clean end.
+                    self.require_grpc_status()?;
                     return Ok(None);
                 }
                 // Incomplete trailer frame — need more data, fall through
@@ -2006,12 +2012,40 @@ where
                         {
                             self.error = Some(ConnectError::deadline_exceeded("request timeout"));
                         }
+                        // A deadline mapped just above takes precedence;
+                        // otherwise a gRPC/gRPC-Web stream that ended without a
+                        // grpc-status trailer is a truncated response.
+                        self.require_grpc_status()?;
                         return Ok(None);
                     }
                     // Loop back to try decoding again
                 }
             }
         }
+    }
+
+    /// Require a terminal `grpc-status` on a finished gRPC/gRPC-Web stream;
+    /// its absence means a truncated response, matching the unary path.
+    ///
+    /// Returns `Ok(())` for Connect, when an error/status was already recorded
+    /// (including a mapped deadline), and when `grpc-status` was observed in the
+    /// trailers or the initial headers (a "Trailers-Only" response).
+    fn require_grpc_status(&self) -> Result<(), ConnectError> {
+        let status_seen = self.headers.contains_key("grpc-status")
+            || self
+                .trailers
+                .as_ref()
+                .is_some_and(|t| t.contains_key("grpc-status"));
+
+        if self.error.is_none()
+            && matches!(self.protocol, Protocol::Grpc | Protocol::GrpcWeb)
+            && !status_seen
+        {
+            return Err(ConnectError::internal(
+                "gRPC response missing grpc-status trailer",
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the trailing metadata, if available.
@@ -4654,6 +4688,132 @@ mod tests {
         assert!(
             err.to_string().contains("no data messages"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ── ServerStream gRPC/gRPC-Web terminal grpc-status enforcement ──
+    // A response must end with a `grpc-status`; reaching EOF without one is a
+    // truncated response, not a clean end (the unary path already enforces it).
+
+    /// Build a gRPC/gRPC-Web `ServerStream` over `body` for these tests.
+    fn grpc_test_stream<B>(
+        protocol: Protocol,
+        headers: http::HeaderMap,
+        body: B,
+    ) -> ServerStream<B, buffa_types::google::protobuf::__buffa::view::StringValueView<'static>>
+    {
+        ServerStream {
+            headers,
+            body,
+            buf: BytesMut::new(),
+            encoding: None,
+            compression: CompressionRegistry::new(),
+            codec_format: CodecFormat::Proto,
+            protocol,
+            max_message_size: Some(1024),
+            deadline: None,
+            trailers: None,
+            error: None,
+            done: false,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// A `Full` body holding one proto data envelope carrying `s`.
+    fn data_envelope_body(s: &str) -> Full<Bytes> {
+        use buffa::Message;
+        use buffa_types::google::protobuf::StringValue;
+        Full::new(Envelope::data(StringValue::from(s).encode_to_bytes()).encode())
+    }
+
+    fn assert_missing_status_err(err: ConnectError) {
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.to_string().contains("grpc-status"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// gRPC: a data message then EOF with no trailers/grpc-status must error.
+    #[tokio::test]
+    async fn grpc_server_stream_missing_grpc_status_errors() {
+        let mut stream = grpc_test_stream(
+            Protocol::Grpc,
+            http::HeaderMap::new(),
+            data_envelope_body("hello"),
+        );
+        let msg = stream
+            .message()
+            .await
+            .expect("decode")
+            .expect("a message before EOF");
+        assert_eq!(msg.value, "hello");
+        let err = stream
+            .message()
+            .await
+            .expect_err("EOF without grpc-status must error");
+        assert_missing_status_err(err);
+    }
+
+    /// gRPC-Web: a data message then EOF with no 0x80 trailer frame must error.
+    #[tokio::test]
+    async fn grpc_web_server_stream_missing_trailer_frame_errors() {
+        let mut stream = grpc_test_stream(
+            Protocol::GrpcWeb,
+            http::HeaderMap::new(),
+            data_envelope_body("hello"),
+        );
+        let msg = stream
+            .message()
+            .await
+            .expect("decode")
+            .expect("a message before EOF");
+        assert_eq!(msg.value, "hello");
+        let err = stream
+            .message()
+            .await
+            .expect_err("EOF without a trailer frame must error");
+        assert_missing_status_err(err);
+    }
+
+    /// gRPC-Web: a complete trailer frame that carries no grpc-status is a
+    /// malformed terminus and must error (the frame-present sibling case).
+    #[tokio::test]
+    async fn grpc_web_server_stream_trailer_frame_without_status_errors() {
+        let payload = b"some-trailer: value\r\n";
+        let mut frame = vec![0x80_u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+
+        let mut stream = grpc_test_stream(
+            Protocol::GrpcWeb,
+            http::HeaderMap::new(),
+            Full::new(Bytes::from(frame)),
+        );
+        let err = stream
+            .message()
+            .await
+            .expect_err("trailer frame without grpc-status must error");
+        assert_missing_status_err(err);
+        assert!(stream.trailers().is_some(), "parsed trailers stay visible");
+    }
+
+    /// Preservation: a gRPC "Trailers-Only" success carries `grpc-status: 0` in
+    /// the initial headers with an empty body — a valid zero-message stream that
+    /// must end cleanly, not be mistaken for a truncated response.
+    #[tokio::test]
+    async fn grpc_server_stream_trailers_only_success_ends_clean() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("grpc-status", http::HeaderValue::from_static("0"));
+
+        let mut stream = grpc_test_stream(Protocol::Grpc, headers, Full::new(Bytes::new()));
+        assert!(
+            stream
+                .message()
+                .await
+                .expect("clean end, not an error")
+                .is_none(),
+            "trailers-only grpc-status:0 must end with Ok(None)"
         );
     }
 }
