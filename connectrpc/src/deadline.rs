@@ -36,9 +36,11 @@ use crate::handler::BoxStream;
 /// mid-write — or an absurdly long one — holding server resources for
 /// hours. `DeadlinePolicy` clamps the client value to a server-controlled
 /// range, applies a server-side default when the client asserts nothing,
-/// and can extend enforcement to streaming bodies (whose initial setup is
-/// already bounded by the server's `tokio::time::timeout`, but whose item
-/// stream is unbounded by default).
+/// and can extend enforcement to streaming response bodies (whose request
+/// receipt and initial setup are already bounded by the server timeout, but
+/// whose item stream is unbounded by default). Client- and bidi-streaming
+/// handlers consume the request body inside the handler, so its receipt is
+/// already inside the handler's deadline.
 ///
 /// Construct via [`DeadlinePolicy::new`] and the `with_*` builders; the
 /// field set is `#[non_exhaustive]` so struct-literal construction is not
@@ -102,7 +104,8 @@ pub struct DeadlinePolicy {
     /// stalled handlers waiting on slow upstreams. `None` = no per-item
     /// bound. Independent of [`enforce_on_streams`](Self::enforce_on_streams):
     /// setting this enables the per-item timer regardless of whether the
-    /// absolute deadline is enforced.
+    /// absolute deadline is enforced. First armed when the stream is
+    /// first polled; re-armed after each yielded item.
     inter_message_timeout: Option<Duration>,
 }
 
@@ -131,7 +134,10 @@ impl DeadlinePolicy {
     ///
     /// Protects server resources against a client asserting an
     /// unreasonably long timeout. There is no default cap — set one for
-    /// any service that accepts untrusted callers.
+    /// any service that accepts untrusted callers. For unary and
+    /// server-streaming RPCs the enforced budget covers request-body
+    /// receipt as well as handler execution, so size it for uploads,
+    /// not just handler runtime.
     #[must_use]
     pub fn with_max(mut self, max: Duration) -> Self {
         self.max = Some(max);
@@ -140,10 +146,13 @@ impl DeadlinePolicy {
 
     /// Set the timeout applied when the client asserts none.
     ///
-    /// Without a default, a request with no timeout header runs unbounded.
-    /// Setting this to your SLA is the cheapest hardening step a service
-    /// can take. The default is server-controlled and is not subject to
-    /// the `min`/`max` clamps — those guard against the *client*.
+    /// Without a default, a request with no timeout header runs unbounded
+    /// — including its body receipt: for unary and server-streaming RPCs
+    /// the budget set here covers receiving the request body as well as
+    /// handler execution. Setting this to your SLA is the cheapest
+    /// hardening step a service can take. The default is server-controlled
+    /// and is not subject to the `min`/`max` clamps — those guard against
+    /// the *client*.
     #[must_use]
     pub fn with_default_timeout(mut self, default: Duration) -> Self {
         self.default = Some(default);
@@ -186,6 +195,12 @@ impl DeadlinePolicy {
     /// Independent of [`with_enforce_on_streams`](Self::with_enforce_on_streams):
     /// the per-item timer takes effect whenever this is set, regardless of
     /// whether the absolute deadline is also enforced on the stream.
+    ///
+    /// The timer first arms when the consumer first polls the stream and
+    /// re-arms after each yielded item, so stream-setup latency before
+    /// the first poll (encoding, header writing, framework overhead) is
+    /// not counted against the first gap — but a handler that stalls
+    /// before producing its first item still times out.
     #[must_use]
     pub fn with_inter_message_timeout(mut self, timeout: Duration) -> Self {
         self.inter_message_timeout = Some(timeout);
@@ -318,7 +333,11 @@ impl<S> DeadlineStream<S> {
         Self {
             inner: Some(inner),
             absolute: absolute.map(tokio::time::sleep),
-            per_item: inter_message.map(tokio::time::sleep),
+            // Do NOT arm the inter-message timer at construction. There is no
+            // prior message yet, so starting the timer here would measure
+            // stream-setup latency rather than the gap between messages. The
+            // lazy arm in `poll_next` starts the timer on the first poll.
+            per_item: None,
             inter_message,
             finished: false,
         }
@@ -335,6 +354,15 @@ where
         let mut this = self.project();
         if *this.finished {
             return Poll::Ready(None);
+        }
+
+        // Lazily arm the inter-message timer on the first poll so that
+        // stream-setup latency before the consumer starts reading is excluded
+        // from the first gap measurement.
+        if this.per_item.is_none()
+            && let Some(d) = this.inter_message
+        {
+            this.per_item.set(Some(tokio::time::sleep(*d)));
         }
 
         // Check the absolute deadline first — once it lapses the whole
@@ -587,6 +615,40 @@ mod tests {
             wrapped.next().await.unwrap().unwrap(),
             Bytes::from_static(b"a")
         );
+        assert!(wrapped.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_latency_before_first_poll_does_not_trigger_timeout() {
+        let p = DeadlinePolicy::new().with_inter_message_timeout(ms(50));
+        let inner: BoxStream<Result<Bytes, ConnectError>> =
+            Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"a"))]));
+        let mut wrapped = p.enforce_on_response_stream(inner, None);
+
+        tokio::time::advance(ms(100)).await;
+
+        let item = wrapped.next().await.unwrap();
+        assert!(
+            item.is_ok(),
+            "expected first item but got deadline error: {item:?}"
+        );
+        assert_eq!(item.unwrap(), Bytes::from_static(b"a"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_that_never_yields_still_times_out() {
+        let p = DeadlinePolicy::new().with_inter_message_timeout(ms(50));
+        let inner: BoxStream<Result<Bytes, ConnectError>> = Box::pin(futures::stream::pending());
+        let mut wrapped = p.enforce_on_response_stream(inner, None);
+
+        let first = futures::poll!(wrapped.next());
+        assert!(first.is_pending());
+
+        tokio::time::advance(ms(100)).await;
+
+        let err = wrapped.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code, crate::ErrorCode::DeadlineExceeded);
+        assert!(err.message.as_deref().unwrap().contains("inter-message"));
         assert!(wrapped.next().await.is_none());
     }
 }

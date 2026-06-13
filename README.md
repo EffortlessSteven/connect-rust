@@ -26,6 +26,8 @@ connectrpc provides:
 - **`connectrpc`** — A Tower-based runtime library implementing the Connect protocol
 - **`protoc-gen-connect-rust`** — A `protoc` plugin that generates service traits, clients, and message types
 - **`connectrpc-build`** — `build.rs` integration for generating code at build time
+- **`connectrpc-health`** — The standard `grpc.health.v1.Health` service, for `grpc_health_probe` / kubelet gRPC probes / service-mesh health checks
+- **`connectrpc-reflection`** — The standard gRPC server reflection service (`grpc.reflection.v1` + `v1alpha`), so `grpcurl`, `buf curl`, Postman, and `grpcui` can discover and call your services
 
 The runtime is built on [`tower::Service`](https://docs.rs/tower/latest/tower/trait.Service.html), making it framework-agnostic. It integrates with any tower-compatible HTTP framework including [Axum](https://docs.rs/axum), [Hyper](https://docs.rs/hyper), and others.
 
@@ -78,7 +80,7 @@ ship Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows
 (`.sig` + `.pem`), and a GitHub-native build provenance attestation.
 
 ```sh
-VERSION=v0.6.1
+VERSION=v0.7.0
 PLATFORM=linux-x86_64        # or darwin-aarch64, etc.
 BASE=https://github.com/anthropics/connect-rust/releases/download/${VERSION}
 BIN=protoc-gen-connect-rust-${VERSION}-${PLATFORM}
@@ -154,7 +156,12 @@ Changing the mount point requires regenerating.
 
 > The underlying option is `extern_path=.=crate::proto` - same format the
 > Buf Schema Registry uses when generating Cargo SDKs. `buffa_module=X`
-> is shorthand for the `.` catch-all case.
+> is shorthand for the `.` catch-all case. Any module an `extern_path`
+> points at must be buffa-generated code from buffa 0.7.0 or newer with
+> views enabled (buffa-types 0.7+ for the well-known types): the service
+> stubs rely on the `HasMessageView` impls and owned-view wrappers that
+> buffa generates alongside each message, just as they rely on the JSON
+> serialization impls.
 
 #### Option B - `build.rs` (generated at build time)
 
@@ -163,7 +170,7 @@ assembled via a single `include!`. No plugin binaries required at build time.
 
 ```toml
 [build-dependencies]
-connectrpc-build = "0.6"
+connectrpc-build = "0.7"
 ```
 
 ```rust
@@ -188,25 +195,24 @@ pub mod proto {
 ### Implement the server
 
 ```rust
-use connectrpc::{Router, ConnectRpcService, Context, ConnectError};
-use buffa::OwnedView;
-use std::sync::Arc;
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 
 struct MyGreetService;
 
 impl GreetService for MyGreetService {
     async fn greet(
         &self,
-        ctx: Context,
-        request: OwnedView<GreetRequestView<'static>>,
-    ) -> Result<(GreetResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, GreetRequest>,
+    ) -> ServiceResult<GreetResponse> {
         // `request` derefs to the view — string fields are borrowed `&str`
-        // directly from the request buffer (zero-copy).
-        let response = GreetResponse {
+        // directly from the request buffer (zero-copy). The borrow lives for
+        // the duration of the call; use `request.to_owned_message()` for
+        // anything that must outlive it (e.g. `tokio::spawn`).
+        Response::ok(GreetResponse {
             greeting: format!("Hello, {}!", request.name),
             ..Default::default()
-        };
-        Ok((response, ctx))
+        })
     }
 }
 ```
@@ -221,6 +227,10 @@ use std::sync::Arc;
 let service = Arc::new(MyGreetService);
 let connect = service.register(ConnectRouter::new());
 
+// Plain HTTP liveness probe for `kubectl`'s httpGet style. For the
+// standard gRPC Health protocol (grpc_health_probe, kubelet `grpc:`
+// probes), mount `connectrpc_health::HealthService` on the Connect
+// router instead — see docs/guide.md#health-checking.
 let app = Router::new()
     .route("/health", get(|| async { "OK" }))
     .fallback_service(connect.into_axum_service());
@@ -301,6 +311,8 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 - **Interceptors** (typed, async per-RPC middleware for unary and streaming calls) - see [docs/guide.md#interceptors](docs/guide.md#interceptors). Interceptors see the resolved `Spec`, headers, deadline, and a lazily decoded message body, and can rewrite or short-circuit the call - the equivalent of `connect-go`'s `WithInterceptors`.
 - **Tower middleware on the server** (gzip, raw header rewriting, generic HTTP concerns below the RPC layer) - see [docs/guide.md#tower-middleware](docs/guide.md#tower-middleware) and [`examples/middleware/`](examples/middleware) for a custom auth layer that stamps caller identity into request extensions.
 - **TLS / mTLS** - see [docs/guide.md#tls](docs/guide.md#tls) and [`examples/eliza/README.md`](examples/eliza/README.md) for cert generation and `Server::with_tls` / `HttpClient::with_tls` patterns.
+- **gRPC health checking** (`grpc.health.v1.Health`, used by `grpc_health_probe`, kubelet `grpc:` probes, and service meshes) - see [docs/guide.md#health-checking](docs/guide.md#health-checking) and the [`connectrpc-health`](connectrpc-health/) crate.
+- **gRPC server reflection** (`grpc.reflection.v1` + `v1alpha`, used by `grpcurl`, `buf curl`, Postman, and `grpcui`) - see the [`connectrpc-reflection`](connectrpc-reflection/) crate, and run [`examples/multiservice/reflection-demo.sh`](examples/multiservice/reflection-demo.sh) for a `buf curl` walkthrough against a live server.
 
 ## Feature Flags
 
@@ -322,21 +334,21 @@ The core crate compiles for `wasm32-unknown-unknown`. Generated clients are gene
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.6", default-features = false, features = ["gzip"] }
+connectrpc = { version = "0.7", default-features = false, features = ["gzip"] }
 ```
 
 ### Minimal build (no compression)
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.6", default-features = false }
+connectrpc = { version = "0.7", default-features = false }
 ```
 
 ### With Axum integration
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.6", features = ["axum"] }
+connectrpc = { version = "0.7", features = ["axum"] }
 ```
 
 ## Generated Code Dependencies
@@ -345,13 +357,56 @@ Code generated by `protoc-gen-connect-rust` requires these dependencies:
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.6", features = ["client"] }
-buffa = { version = "0.6", features = ["json"] }
-buffa-types = { version = "0.6", features = ["json"] }
+connectrpc = { version = "0.7", features = ["client"] }
+buffa = { version = "0.7", features = ["json"] }
+buffa-types = { version = "0.7", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 http-body = "1"
 ```
+
+### Optional: gate the client behind a Cargo feature
+
+If you want a server-only build of your crate to drop the
+`connectrpc/client` transport stack, opt in to the cfg gate. With
+`buf generate`:
+
+```yaml
+# buf.gen.yaml
+plugins:
+  - local: protoc-gen-connect-rust
+    out: src/gen/connect
+    opt: [buffa_module=crate::proto, gate_client_feature]
+```
+
+Or with `connectrpc-build` in `build.rs`:
+
+```rust
+// build.rs
+connectrpc_build::Config::new()
+    .files(&["proto/greet.proto"])
+    .includes(&["proto/"])
+    .gate_client_feature(true)
+    .compile()?;
+```
+
+The codegen then prefixes every emitted `FooClient<T>` struct and its
+`impl` block with `#[cfg(feature = "client")]`. Declare the feature in
+your `Cargo.toml` to forward it through to the runtime dep:
+
+```toml
+[features]
+default = ["client"]
+client = ["connectrpc/client"]
+
+[dependencies]
+connectrpc = { version = "0.7", features = ["server"] }  # no "client"
+```
+
+`cargo build --no-default-features` now leaves out the `FooClient` items
+*and* drops `connectrpc/client` (the HTTP/2 transport stack) from the
+dependency graph. See `connectrpc-health` for the minimal example. The
+option is opt-in; the default emission is unconditional.
 
 ## Protocol Support
 
@@ -373,7 +428,11 @@ client suites with `task conformance:test-client-*`.
 | Client streaming | ✓ |
 | Bidirectional streaming | ✓ |
 
-Not yet implemented: gRPC server reflection.
+The gRPC server reflection service (`grpc.reflection.v1` and `v1alpha`)
+is provided by the [`connectrpc-reflection`](connectrpc-reflection/)
+crate, fed by `connectrpc_build::Config::emit_descriptor_set` (which
+writes the `FileDescriptorSet` with its full import closure to `OUT_DIR`
+for `include_bytes!`) or by an existing `buffa_descriptor::DescriptorPool`.
 
 ## Performance
 

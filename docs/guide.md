@@ -17,6 +17,9 @@ with the [README quick start](../README.md#quick-start) and the
 - [Tower middleware](#tower-middleware)
 - [Interceptors](#interceptors)
 - [Hosting](#hosting)
+- [Health checking](#health-checking)
+- [Server reflection](#server-reflection)
+- [Production hardening](#production-hardening)
 - [Clients](#clients)
 - [Errors and status codes](#errors-and-status-codes)
 - [Compression](#compression)
@@ -24,19 +27,21 @@ with the [README quick start](../README.md#quick-start) and the
 
 ## Installation
 
-`connectrpc` ships as three crates:
+`connectrpc` ships as five crates:
 
 | Crate | Purpose |
 |---|---|
 | `connectrpc` | Tower-based runtime: server dispatcher, client transports, codec, compression |
 | `protoc-gen-connect-rust` (binary, in `connectrpc-codegen`) | `protoc` plugin that generates service stubs |
 | `connectrpc-build` | `build.rs` integration that runs the codegen at build time |
+| `connectrpc-health` | The standard `grpc.health.v1.Health` service for liveness / readiness probes ([Health checking](#health-checking)) |
+| `connectrpc-reflection` | The standard gRPC server reflection service (`grpc.reflection.v1` + `v1alpha`) for `grpcurl` / `buf curl` / Postman / `grpcui` ([Server reflection](#server-reflection)) |
 
 Add the runtime to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-connectrpc = "0.5"
+connectrpc = "0.7"
 ```
 
 The runtime depends on [`buffa`](https://github.com/anthropics/buffa)
@@ -70,16 +75,16 @@ Common combinations:
 
 ```toml
 # Just the server, behind axum
-connectrpc = { version = "0.5", features = ["axum"] }
+connectrpc = { version = "0.7", features = ["axum"] }
 
 # Server + client, both with TLS
-connectrpc = { version = "0.5", features = ["axum", "client", "tls"] }
+connectrpc = { version = "0.7", features = ["axum", "client", "tls"] }
 
 # Built-in server (no axum)
-connectrpc = { version = "0.5", features = ["server"] }
+connectrpc = { version = "0.7", features = ["server"] }
 
 # Minimal (wasm-friendly: no networking, no native compression)
-connectrpc = { version = "0.5", default-features = false }
+connectrpc = { version = "0.7", default-features = false }
 ```
 
 ## Quick start
@@ -103,7 +108,7 @@ Generate code with `connectrpc-build` in `build.rs`:
 
 ```toml
 [build-dependencies]
-connectrpc-build = "0.5"
+connectrpc-build = "0.7"
 ```
 
 ```rust
@@ -123,8 +128,7 @@ Implement the service:
 ```rust
 // src/main.rs
 use std::sync::Arc;
-use buffa::view::OwnedView;
-use connectrpc::{RequestContext, Response, Router, ServiceResult};
+use connectrpc::{RequestContext, Response, Router, ServiceRequest, ServiceResult};
 
 pub mod proto {
     connectrpc::include_generated!();
@@ -137,7 +141,7 @@ impl GreetService for MyGreet {
     async fn greet(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<GreetRequestView<'static>>,
+        req: ServiceRequest<'_, GreetRequest>,
     ) -> ServiceResult<GreetResponse> {
         Response::ok(GreetResponse {
             greeting: format!("Hello, {}!", req.name),
@@ -193,6 +197,15 @@ fn main() {
 Output is unified: message types and service stubs in one file per
 proto, included into your crate with `connectrpc::include_generated!()`.
 Best for simple projects.
+
+If you need the compiled `FileDescriptorSet` at runtime — most commonly
+to feed the [`connectrpc-reflection`](#server-reflection) crate — chain
+`.emit_descriptor_set("svc_descriptor.bin")` before `.compile()`. The
+name must be a bare file name (no path separators). The set (including
+the full transitive import closure) is written to `OUT_DIR` and can be
+embedded with
+`include_bytes!(concat!(env!("OUT_DIR"), "/svc_descriptor.bin"))`. See
+the `Config::emit_descriptor_set` rustdoc for details.
 
 ### `buf generate` (checked-in code, production-grade)
 
@@ -258,8 +271,8 @@ trait name matches the proto service name (`GreetService` becomes
 
 ### Handler signatures
 
-Unary handlers take a read-only `RequestContext` plus an
-`OwnedView<RequestView<'static>>`, and return
+Unary handlers take a read-only `RequestContext` plus a borrowed
+`ServiceRequest<'_, RequestType>`, and return
 `ServiceResult<ResponseType>`:
 
 ```rust
@@ -267,9 +280,9 @@ impl GreetService for MyGreet {
     async fn greet(
         &self,
         _ctx: RequestContext,
-        req: OwnedView<GreetRequestView<'static>>,
+        req: ServiceRequest<'_, GreetRequest>,
     ) -> ServiceResult<GreetResponse> {
-        // req derefs to the view: zero-copy field access.
+        // req derefs to the request view: zero-copy field access.
         // String fields are &str borrowed from the request buffer.
         Response::ok(GreetResponse {
             greeting: format!("Hello, {}!", req.name),
@@ -279,10 +292,12 @@ impl GreetService for MyGreet {
 }
 ```
 
-The `OwnedView` shape lets handlers read string fields without
-allocating - `req.name` is a `&str` directly into the request bytes.
-Call `.to_owned_message()` to get the prost-style owned struct when
-you need it.
+The `ServiceRequest` shape lets handlers read string fields without
+allocating - `req.name` is a `&str` directly into the request bytes,
+and the borrow may be held across `.await` points. The request is
+borrowed from the dispatcher-owned body, so the response (and anything
+moved into `tokio::spawn`) cannot borrow from it - call
+`.to_owned_message()` to get the owned struct when you need one.
 
 ### `RequestContext` and `Response`
 
@@ -296,7 +311,7 @@ methods (new request-scoped metadata can then be added in minor releases):
 |---|---|
 | `ctx.header(name)` / `ctx.headers()` | Caller-supplied headers (after protocol-prefix stripping) |
 | `ctx.deadline()` | Absolute `Instant` if the caller set a timeout |
-| `ctx.time_remaining()` | Saturating `Duration` until the deadline — budget downstream calls with this |
+| `ctx.time_remaining()` | Saturating `Option<Duration>` until the deadline (`None` when no deadline is set) — budget downstream calls with this |
 | `ctx.extensions()` | `http::Extensions` carried from the underlying `http::Request` |
 | `ctx.path()` | Requested procedure path (`/package.Service/Method`) from the request URI |
 | `ctx.spec()` | Static metadata for the dispatched RPC method ([`Spec`](#static-method-metadata-spec)); `None` only for `route_*` registrations without `with_spec` |
@@ -337,7 +352,7 @@ builder:
 async fn greet(
     &self,
     _ctx: RequestContext,
-    req: OwnedView<GreetRequestView<'static>>,
+    req: ServiceRequest<'_, GreetRequest>,
 ) -> ServiceResult<GreetResponse> {
     Ok(Response::new(GreetResponse { /* ... */ })
         .with_header("x-greet-version", "v2")
@@ -387,25 +402,30 @@ or `#[allow(refining_impl_trait)]` on the impl block.
 
 For handlers that often return the request unchanged (proxies, filters,
 validators), the `Encodable<M>` bound lets you skip the owned-message
-allocation by returning the request view directly. Codegen emits
+allocation by returning an `OwnedView` rebuilt zero-copy from the
+retained request bytes (the request itself is borrowed and cannot
+outlive the call, so it is re-decoded - a Bytes refcount bump plus a
+decode walk, with no per-field copy). Codegen emits
 `OwnedFooView` aliases and `impl Encodable<Foo> for OwnedFooView` per
 RPC type. (When two RPC types in the same package would alias to the
 same `OwnedFooView` name — e.g. a local `MyMessage` plus an imported
-`api.v1.foo.bar.MyMessage` — the alias is suppressed for both and the
-trait signature uses the inlined `OwnedView<…View<'static>>` form
-instead.) `connectrpc::MaybeBorrowed` covers the conditional case:
+`api.v1.foo.bar.MyMessage` — the alias is suppressed for both; spell
+the inlined `OwnedView<…View<'static>>` form for those types.) `connectrpc::MaybeBorrowed` covers the conditional case:
 
 ```rust
-use connectrpc::{MaybeBorrowed, RequestContext, Response, ServiceResult};
+use connectrpc::{MaybeBorrowed, RequestContext, Response, ServiceRequest, ServiceResult};
+// `Record` and `OwnedRecordView` come from your generated module.
 
 async fn redact(
     &self,
     _ctx: RequestContext,
-    req: OwnedRecordView,
+    req: ServiceRequest<'_, Record>,
 ) -> ServiceResult<MaybeBorrowed<Record, OwnedRecordView>> {
     if req.email.is_empty() && req.ssn.is_empty() {
-        // pass-through: re-encode straight from the request bytes
-        return Response::ok(MaybeBorrowed::Borrowed(req));
+        // Pass-through. The response must be 'static, so rebuild an
+        // OwnedView from the retained body bytes - zero-copy (Bytes
+        // refcount + decode walk), then re-encode via ViewEncode.
+        return Response::ok(MaybeBorrowed::Borrowed(req.to_owned_view()));
     }
     let mut owned = req.to_owned_message();
     owned.email.clear();
@@ -497,7 +517,7 @@ metadata):
 async fn range(
     &self,
     _ctx: RequestContext,
-    req: OwnedView<RangeRequestView<'static>>,
+    req: ServiceRequest<'_, RangeRequest>,
 ) -> ServiceResult<ServiceStream<RangeResponse>> {
     let stream = futures::stream::iter(/* ... */);
     Response::stream_ok(stream)
@@ -506,22 +526,31 @@ async fn range(
 
 ### Client streaming
 
-The handler receives a stream of request views and returns a single
-response:
+The handler receives a stream of `StreamMessage<Req>` items and
+returns a single response. Each item owns its decoded buffer, is
+`Send + 'static` (so it can be buffered or moved into spawned tasks),
+and exposes zero-copy accessor methods per field:
 
 ```rust
 async fn sum(
     &self,
     _ctx: RequestContext,
-    mut requests: ServiceStream<OwnedView<SumRequestView<'static>>>,
+    mut requests: ServiceStream<StreamMessage<SumRequest>>,
 ) -> ServiceResult<SumResponse> {
     let mut total: i64 = 0;
     while let Some(req) = requests.next().await {
-        total += req?.value.unwrap_or(0) as i64;
+        total += req?.value().unwrap_or(0) as i64;
     }
     Response::ok(SumResponse { total: Some(total), ..Default::default() })
 }
 ```
+
+The request stream yields `Err(ConnectError)` if the upload fails partway
+— a truncated body or broken transport — so a partial stream is not
+mistaken for a complete one. The `req?` in the loop above propagates that
+error as the RPC's failure, which is the right default for handlers that
+aggregate inbound messages. Only a clean `None` means the client finished
+the stream.
 
 ### Bidirectional streaming
 
@@ -532,7 +561,7 @@ emit messages independently:
 async fn running_sum(
     &self,
     _ctx: RequestContext,
-    requests: ServiceStream<OwnedView<RunningSumRequestView<'static>>>,
+    requests: ServiceStream<StreamMessage<RunningSumRequest>>,
 ) -> ServiceResult<ServiceStream<RunningSumResponse>> {
     // Map the request stream to a response stream however you like.
     let response_stream = futures::stream::unfold(/* ... */);
@@ -555,21 +584,32 @@ handle with `.send(req).await?` and `.message().await?` plus
 `.close_send()`:
 
 ```rust
-// Server streaming
+// Server streaming. Each item is an `OwnedView` of the response view
+// (not the deref-ready view that unary `.view()` returns), so field
+// access goes through `.reborrow()` - zero-copy, same as Pattern 2 in
+// [Reading the response](#reading-the-response).
 let mut stream = client.range(req).await?;
 while let Some(msg) = stream.message().await? {
-    // ...
+    println!("{}", msg.reborrow().value.unwrap_or_default());
 }
 
 // Client streaming - takes a Vec
 let resp = client.sum(vec![req1, req2, req3]).await?;
 
-// Bidi
+// Bidi - received items are `OwnedView`s too, read via `.reborrow()`
 let mut bidi = client.running_sum().await?;
 bidi.send(req).await?;
-let reply = bidi.message().await?;
+if let Some(reply) = bidi.message().await? {
+    println!("{}", reply.reborrow().total.unwrap_or_default());
+}
 bidi.close_send();
 ```
+
+`?` on `message()` is the complete error handling: `Ok(None)` means the
+server finished cleanly, and a terminal RPC error — including a
+gRPC/gRPC-Web stream that ends without a usable `grpc-status` — comes
+back as `Err`, sticky across calls. The `error()` and `trailers()`
+accessors remain available afterwards for post-hoc inspection.
 
 Both `streaming-tour/src/client.rs` and the eliza example show these
 patterns end-to-end.
@@ -653,7 +693,7 @@ generated client.
 async fn greet(
     &self,
     ctx: RequestContext,
-    req: OwnedView<GreetRequestView<'static>>,
+    req: ServiceRequest<'_, GreetRequest>,
 ) -> ServiceResult<GreetResponse> {
     if let Some(spec) = ctx.spec() {
         tracing::info_span!(
@@ -977,6 +1017,136 @@ mtls-identity example
 demonstrates `serve_tls` end-to-end with cert-SAN identity extraction
 and an ACL keyed on it.
 
+## Health checking
+
+The `connectrpc-health` crate implements the standard
+`grpc.health.v1.Health` service. Mount it on your Connect router and
+clients like `grpc_health_probe`, kubelet's `grpc:` probe, and gRPC-aware
+service meshes (Linkerd, Istio) just work.
+
+This is the gRPC protocol — different from the plain HTTP `GET /health`
+route shown earlier in the [Hosting](#hosting) section. Keep the HTTP
+route for `httpGet:` probes; add the gRPC service for `grpc:` probes.
+
+```toml
+[dependencies]
+connectrpc = { version = "0.7", features = ["server"] }
+connectrpc-health = "0.7"
+```
+
+```rust,no_run
+use connectrpc::Router;
+use connectrpc_health::{install_static, Status};
+
+// `install_static` registers every name with `Status::Serving`; use the
+// generated `*_SERVICE_NAME` constants from your service stubs so the
+// registered name matches exactly what clients ask for. The
+// whole-process `""` entry is seeded for you, so probes that don't
+// pass a service name also work.
+let (router, health) = install_static(Router::new(), [
+    proto::greet::v1::GREET_SERVICE_SERVICE_NAME,
+]);
+
+// Flip status when something goes wrong. `set_status` errors on an
+// unknown name, so typos surface immediately instead of silently
+// shadowing the real entry.
+health
+    .set_status(proto::greet::v1::GREET_SERVICE_SERVICE_NAME, Status::NotServing)
+    .expect("registered above");
+
+// At shutdown, drain. `shutdown()` flips every registered service,
+// including the empty whole-process entry:
+health.shutdown();
+```
+
+For custom logic (e.g. report `NotServing` while a database connection
+is down), implement the `Checker` trait directly and wrap it in
+`HealthService::new(...)` or `HealthService::from_arc(...)`. The default
+`Checker::watch` body returns `Unimplemented`, which is fine for
+Check-only probes; override it if your probes call Watch.
+
+The `HealthClient` (for in-process probes, integration tests, sidecar
+tooling) is gated on a `client` Cargo feature that is **on by default**.
+Server-only deployments turn it off:
+
+```toml
+[dependencies]
+connectrpc = { version = "0.7", features = ["server"] }
+connectrpc-health = { version = "0.7", default-features = false }
+```
+
+That drops `connectrpc/client` (the HTTP/2 transport stack) from the
+dependency graph entirely. `use connectrpc_health::HealthClient` then
+becomes an unresolved import, but the binary stays lean.
+
+**Unknown services on `Watch`.** Non-empty unregistered services return
+`Err(ConnectError::not_found(_))` from both `Check` and `Watch`; the
+empty service auto-subscribes on `Watch` and returns `Serving` on
+`Check` by default. The gRPC Health spec additionally describes a
+`SERVICE_UNKNOWN` keep-stream-open flow for `Watch` that this crate
+does not implement, matching the Go `connectrpc.com/grpchealth`
+reference. Every probe that treats any error as a failure — kubelet's
+`grpc:` probe, `grpc_health_probe`, Linkerd, Istio — works unchanged.
+See `HealthService`'s `# Unknown services` section in the crate docs
+for the full context.
+
+## Server reflection
+
+The `connectrpc-reflection` crate implements the standard gRPC server
+reflection service (`grpc.reflection.v1` and its `v1alpha` predecessor),
+so schema-aware clients — `grpcurl`, `buf curl`, Postman, `grpcui` —
+can discover and call your services without local proto files, over
+gRPC, gRPC-Web, and the Connect protocol alike.
+
+```toml
+[dependencies]
+connectrpc = { version = "0.7", features = ["server"] }
+connectrpc-reflection = "0.7"
+```
+
+Emit a descriptor set from your build script (see
+[Code generation](#code-generation)), embed it, and mount the service:
+
+```rust,ignore
+// build.rs: .emit_descriptor_set("app.fds.bin") before .compile()
+use connectrpc::Router;
+use connectrpc_reflection::{Reflector, install};
+
+let bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app.fds.bin"));
+let reflector = Reflector::from_descriptor_set_bytes(bytes)?;
+// `router` is your service router from `register()`.
+let router = install(router, reflector); // mounts v1 + v1alpha
+```
+
+Alternatively, when your buffa codegen has reflection enabled, serve
+straight from the generated package's descriptor pool with
+`Reflector::from_descriptor_pool(proto::descriptor_pool().clone())` —
+no build-script step. The bytes path answers with the compiler's
+original per-file descriptor bytes; the pool path re-encodes
+(semantically faithful, unknown fields preserved). See the `Reflector`
+crate docs for the trade-off.
+
+> **Reflection intentionally publishes your schema.** Everything in
+> the descriptor set is exposed — all files, their transitive imports,
+> and every compiled service, whether or not its handlers are mounted.
+> Gate or omit the service on deployments where that is not wanted.
+
+Two more behaviors worth knowing before deploying:
+
+- **`Reflector::with_services` curates the advertised list** (the
+  override is verbatim, like Go `grpcreflect`'s `Namer`) — use it when
+  the descriptor set compiles in more services than you want to
+  advertise; `Reflector::service_names` inspects the current list.
+- **The service is self-describing**: queries about `grpc.reflection.*`
+  fall back to the crate's own descriptors and `ListServices` includes
+  the reflection services, matching grpc-go. Schema-free callers like
+  `buf curl` need this to invoke `ServerReflectionInfo` at all.
+
+The [multiservice example](../examples/multiservice) mounts reflection
+with both descriptor sources (selectable via `REFLECTION_SOURCE=fds|pool`),
+and [`reflection-demo.sh`](../examples/multiservice/reflection-demo.sh)
+walks through discovery and schema-free calls with `buf curl`.
+
 ## Production hardening
 
 ### Deadline policy
@@ -1007,10 +1177,14 @@ Why each knob:
 
 - **`with_max`** is the most important one for any service that accepts
   untrusted callers — without it a client controls how long a worker
-  stays busy. Set it to your longest acceptable handler runtime.
+  stays busy. Set it to your longest acceptable request — for unary and
+  server-streaming RPCs the capped budget covers receiving the request
+  body as well as handler execution, so size it for uploads, not just
+  handler runtime.
 - **`with_default_timeout`** matters because the timeout header is
   optional. A request that omits it has no bound at all unless you set
-  one. Set it to your SLA.
+  one. Set it to your SLA. For unary and server-streaming RPCs, the
+  budget includes receiving the request body as well as handler execution.
 - **`with_min`** protects against a misbehaving or adversarial client
   cancelling the handler before it can do anything (e.g. mid-write on a
   streaming response). A few milliseconds is usually enough.
@@ -1025,7 +1199,9 @@ Why each knob:
 - **`with_inter_message_timeout(d)`** detects stalled streams (a
   handler waiting on a slow upstream). Independent of
   `with_enforce_on_streams` — takes effect whenever set, with or
-  without the absolute deadline. Resets on each yielded item.
+  without the absolute deadline. Arms when the response stream is
+  first polled (stream-setup latency before that is not counted) and
+  resets on each yielded item.
 
 `DeadlinePolicy::new()` with no `with_*` calls is a no-op that
 preserves the prior default behavior. Existing services see no change
@@ -1036,13 +1212,16 @@ target `connectrpc::deadline` with the path and before/after
 durations. Enable `RUST_LOG=connectrpc::deadline=debug` to spot
 misbehaving clients.
 
-Inside a handler, `ctx.deadline` reflects the *moderated* value (after
-clamping), so the handler can budget downstream calls — propagate the
-remaining time minus a margin as the timeout for outbound RPCs:
+Inside a handler, `ctx.deadline()` reflects the *moderated* value
+(after clamping), so the handler can budget downstream calls —
+propagate the remaining time minus a margin as the timeout for
+outbound RPCs. `ctx.time_remaining()` does the subtraction for you
+(`None` when the request has no deadline):
 
 ```rust,ignore
-use std::time::Instant;
-let remaining = ctx.deadline.map(|d| d.saturating_duration_since(Instant::now()));
+if let Some(remaining) = ctx.time_remaining() {
+    options = options.with_timeout(remaining.saturating_sub(margin));
+}
 ```
 
 ## Clients
@@ -1115,17 +1294,18 @@ Unary responses give you several access patterns:
 ```rust
 let resp = client.greet(req).await?;
 
-// Pattern 1: borrow the view via .view(). Zero-copy. Use this when
-// you also need headers/trailers - OwnedView derefs to the view, so
-// field access (.greeting -> &str) works directly.
+// Pattern 1: borrow the view via .view(). Zero-copy. Field access
+// (.greeting -> &str) works directly on the returned view, and the
+// response handle keeps headers/trailers available alongside it.
 println!("{}", resp.view().greeting);
 let _ = resp.headers();
 let _ = resp.trailers();
 
 // Pattern 2: consume via .into_view() to get the OwnedView. Still
-// zero-copy via Deref, but discards headers/trailers.
+// zero-copy - read fields through .reborrow() - but discards
+// headers/trailers.
 let msg = client.greet(req).await?.into_view();
-let greeting: &str = msg.greeting;
+let greeting: &str = msg.reborrow().greeting;
 
 // Pattern 3: .into_owned() for the prost-style owned struct.
 // Allocates and copies all string/bytes fields.
@@ -1169,9 +1349,8 @@ pub struct ConnectError {
     pub code: ErrorCode,
     pub message: Option<String>,
     pub details: Vec<ErrorDetail>,
-    pub headers: http::HeaderMap,
-    pub trailers: http::HeaderMap,
-    // ...
+    // response headers and trailers: private, exposed via the
+    // response_headers()/trailers() accessors and their _mut variants
 }
 ```
 
@@ -1216,7 +1395,7 @@ response via `Response::compress`:
 async fn greet(
     &self,
     _ctx: RequestContext,
-    req: OwnedView<GreetRequestView<'static>>,
+    req: ServiceRequest<'_, GreetRequest>,
 ) -> ServiceResult<GreetResponse> {
     let mut resp = Response::new(/* ... */);
     if response_is_huge() {
@@ -1267,8 +1446,9 @@ let service = ConnectRpcService::new(router).with_compression(registry);
 | [`middleware/`](../examples/middleware) | Server-side tower middleware composition: an `axum::middleware::from_fn` bearer-token auth, identity passthrough via `RequestContext::extensions()`, response trailers via `Response::with_trailer`. Client demos `ClientConfig::with_default_header` and `CallOptions::with_timeout`. |
 | [`mtls-identity/`](../examples/mtls-identity) | mTLS twin of `middleware/`: axum hosted behind `connectrpc::axum::serve_tls`, identity from the client cert's DNS SAN via `PeerCerts` instead of a bearer token, ACL keyed on the cert-derived identity. In-memory `rcgen` PKI; no PEM files. |
 | [`eliza/`](../examples/eliza) | Production-shaped streaming app: a port of the `connectrpc/examples-go` ELIZA demo. Server-streaming Introduce + bidi-streaming Converse, TLS, mTLS, CORS, IPv6, both server and client binaries, interoperates with the hosted Go reference at `demo.connectrpc.com`. |
-| [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage. |
+| [`multiservice/`](../examples/multiservice) | Multiple proto packages compiled together with `buf generate`, multiple services on one server, well-known type usage, and server reflection mounted from both descriptor sources (`REFLECTION_SOURCE=fds\|pool`; see `reflection-demo.sh`). |
 | [`wasm-client/`](../examples/wasm-client) | Browser fetch transport: same generated client used from `wasm32-unknown-unknown` with a custom `ClientTransport` backed by `web-sys::fetch`. |
 | [`bazel/`](../examples/bazel) | Bazel build integration via custom rules. |
 
-Each example has its own README with run instructions.
+Most examples have their own README with run instructions; the rest
+document themselves through their `test.sh` / demo scripts.

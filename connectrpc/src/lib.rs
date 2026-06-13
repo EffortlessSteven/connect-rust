@@ -65,23 +65,34 @@
 //! - [`envelope`] - Streaming message framing (5-byte header + payload)
 //! - [`error`] - ConnectRPC error types and HTTP status mapping
 //! - [`handler`] - Async handler traits for implementing RPC methods
+//! - [`request`] - Borrowed single-message request views ([`ServiceRequest`])
+//! - [`stream_message`] - Owned per-item streaming message wrapper ([`StreamMessage`])
+//! - [`response`] - Handler response types and [`RequestContext`]
 //! - [`router`] - Request routing and service registration
 //! - [`service`] - Tower service implementation (primary integration point)
+//! - [`dispatcher`] - Method dispatch glue between router and generated code
 //! - [`spec`] - Static per-method metadata ([`Spec`], [`StreamType`])
 //! - [`payload`] - Lazily-decoded, type-erased message bodies ([`Payload`])
 //! - [`interceptor`] - RPC-level interceptors ([`Interceptor`], [`Next`])
-//! - [`client`] - Tower-based HTTP client utilities (requires `client` feature)
+//! - [`deadline`] - Server-side deadline moderation ([`DeadlinePolicy`])
+//! - [`protocol`] - Protocol detection ([`Protocol`]: Connect, gRPC, gRPC-Web)
+//! - [`client`] - Tower-based HTTP client utilities (transports require the `client` feature)
 //! - [`server`] - Standalone hyper-based server (requires `server` feature)
 //!
 //! # Protocol Support
 //!
-//! This implementation follows the ConnectRPC protocol specification:
-//! - Unary RPC calls (request-response)
+//! Servers speak the [Connect protocol](https://connectrpc.com/docs/protocol),
+//! gRPC, and gRPC-Web from a single registration; clients can be configured
+//! for any of the three:
+//! - All four RPC shapes: unary, server-streaming, client-streaming, bidi
+//!   (full-duplex bidi requires HTTP/2; browsers additionally cannot
+//!   stream request bodies, regardless of protocol)
 //! - Proto and JSON message encoding
 //! - Compression negotiation (gzip, zstd) with streaming support
 //! - Error handling with proper HTTP status mapping
 //! - Trailers via `trailer-` prefixed headers
 //! - Envelope framing for streaming messages
+//! - Deadline propagation and server-side deadline moderation
 //!
 //! # Client
 //!
@@ -193,10 +204,12 @@ pub mod handler;
 pub mod interceptor;
 pub mod payload;
 pub mod protocol;
+pub mod request;
 pub mod response;
 pub mod router;
 pub mod service;
 pub mod spec;
+pub mod stream_message;
 
 // Optional: HTTP client
 pub mod client;
@@ -251,6 +264,8 @@ pub use handler::view_bidi_streaming_handler_fn;
 pub use handler::view_client_streaming_handler_fn;
 pub use handler::view_handler_fn;
 pub use handler::view_streaming_handler_fn;
+pub use request::HasMessageView;
+pub use request::ServiceRequest;
 pub use response::Encodable;
 pub use response::EncodedResponse;
 pub use response::MaybeBorrowed;
@@ -259,6 +274,7 @@ pub use response::RequestContext;
 pub use response::Response;
 pub use response::ServiceResult;
 pub use response::ServiceStream;
+pub use stream_message::StreamMessage;
 
 /// Re-exports for generated code. Not part of the public API; subject
 /// to change without a semver bump.

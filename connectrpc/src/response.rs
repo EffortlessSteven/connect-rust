@@ -486,6 +486,13 @@ pub type ServiceResult<B> = Result<Response<B>, ConnectError>;
 ///
 /// Used as the request type for client/bidi-streaming handlers and the
 /// body type for server/bidi-streaming responses.
+///
+/// For an inbound request stream, `None` means the client finished the
+/// stream cleanly; `Some(Err(..))` means the stream ended abnormally — a
+/// decode failure or a request body that failed mid-upload (truncated or
+/// broken transport). Treat only `None` as a complete stream; propagating
+/// the error with `?` fails the RPC, which is the right default for
+/// handlers that aggregate inbound messages.
 pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> + Send>>;
 
 // ---------------------------------------------------------------------------
@@ -501,6 +508,8 @@ pub type ServiceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ConnectError>> +
 ///   emitted by codegen per RPC output type;
 /// - [`MaybeBorrowed<M, V>`] for handlers that conditionally return
 ///   either;
+/// - [`StreamMessage<M>`](crate::StreamMessage) for echoing inbound
+///   stream items back out (re-encodes from the retained wire bytes);
 /// - [`PreEncoded`] for handlers that encode a non-`'static` view
 ///   internally and pass the bytes across the handler boundary.
 ///

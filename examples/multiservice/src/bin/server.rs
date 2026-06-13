@@ -8,25 +8,60 @@
 //! Test with:
 //!   - `curl http://localhost:8080/health`
 //!   - `cargo run --bin multiservice-client`
+//!
+//! The server also mounts gRPC server reflection (`grpc.reflection.v1` +
+//! `v1alpha`), so schema-aware tools can discover and call the services
+//! with no local proto files — see `./reflection-demo.sh` for a `buf curl`
+//! walkthrough.
 
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::Router;
 use axum::routing::get;
-use buffa::view::OwnedView;
 // `value` (lowercase) is the oneof submodule for `Value`'s `kind`
 // oneof, re-exported at the natural path by buffa 0.5+.
 use buffa_types::google::protobuf::{Duration, Struct, Timestamp, Value, value};
 use connectrpc::ConnectError;
 use connectrpc::Router as ConnectRouter;
-use connectrpc::{RequestContext, Response, ServiceResult};
-use multiservice_example::proto::anthropic::connectrpc::greet::v1::GreetRequestView;
-use multiservice_example::proto::anthropic::connectrpc::math::v1::AddRequestView;
-use multiservice_example::proto::anthropic::connectrpc::wkt::v1::{
-    CalculateDurationRequestView, CreateEventRequestView, ProcessMetadataRequestView,
-};
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+use connectrpc_reflection::Reflector;
 use multiservice_example::*;
+
+/// The `FileDescriptorSet` for every proto this server compiles, with the
+/// full import closure — the input to gRPC server reflection.
+///
+/// This example uses checked-in generated code, so the set is produced by
+/// `buf build` during `task example:multiservice:generate` and checked in
+/// alongside it. A `build.rs`-based project gets the same bytes from
+/// `connectrpc_build::Config::emit_descriptor_set("services.fds.bin")` and
+/// would point this `include_bytes!` at `concat!(env!("OUT_DIR"), ...)`.
+const DESCRIPTOR_SET: &[u8] = include_bytes!("../../descriptor/services.fds.bin");
+
+/// Build the reflection index from one of the two supported descriptor
+/// sources, selected by `REFLECTION_SOURCE`:
+///
+/// - `fds` (default) — the checked-in `FileDescriptorSet` bytes above.
+///   Responses carry those exact per-file bytes.
+/// - `pool` — the `descriptor_pool()` that buffa codegen emits with
+///   `reflect_mode=bridge` (see `buf.gen.yaml`). The pool covers the whole
+///   codegen run, so any one package's accessor works; no descriptor file
+///   is needed at all.
+fn build_reflector() -> Reflector {
+    match std::env::var("REFLECTION_SOURCE").as_deref() {
+        Ok("pool") => {
+            tracing::info!("reflection source: generated descriptor_pool()");
+            let pool = proto::anthropic::connectrpc::greet::v1::descriptor_pool();
+            Reflector::from_descriptor_pool(Arc::clone(pool))
+                .expect("generated descriptor pool is valid")
+        }
+        _ => {
+            tracing::info!("reflection source: checked-in FileDescriptorSet");
+            Reflector::from_descriptor_set_bytes(DESCRIPTOR_SET)
+                .expect("checked-in descriptor set is valid")
+        }
+    }
+}
 
 /// Implementation of the GreetService trait.
 struct MyGreetService;
@@ -35,9 +70,10 @@ impl GreetService for MyGreetService {
     async fn greet(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<GreetRequestView<'static>>,
+        request: ServiceRequest<'_, GreetRequest>,
     ) -> ServiceResult<GreetResponse> {
-        let request = request.to_owned_message();
+        // Zero-copy reads: `request.name` is a &str borrowed from the
+        // decoded request buffer - no owned conversion needed.
         tracing::info!("Received greet request for: {}", request.name);
 
         if request.name.is_empty() {
@@ -59,9 +95,8 @@ impl MathService for MyMathService {
     async fn add(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<AddRequestView<'static>>,
+        request: ServiceRequest<'_, AddRequest>,
     ) -> ServiceResult<AddResponse> {
-        let request = request.to_owned_message();
         tracing::info!("Received add request: {} + {}", request.a, request.b);
 
         let result = request
@@ -85,7 +120,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
     async fn create_event(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<CreateEventRequestView<'static>>,
+        request: ServiceRequest<'_, CreateEventRequest>,
     ) -> ServiceResult<CreateEventResponse> {
         let request = request.to_owned_message();
         tracing::info!("Received create_event request: {:?}", request.name);
@@ -135,7 +170,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
     async fn calculate_duration(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<CalculateDurationRequestView<'static>>,
+        request: ServiceRequest<'_, CalculateDurationRequest>,
     ) -> ServiceResult<CalculateDurationResponse> {
         let request = request.to_owned_message();
         tracing::info!("Received calculate_duration request");
@@ -169,7 +204,7 @@ impl WellKnownTypesService for MyWellKnownTypesService {
     async fn process_metadata(
         &self,
         _ctx: RequestContext,
-        request: OwnedView<ProcessMetadataRequestView<'static>>,
+        request: ServiceRequest<'_, ProcessMetadataRequest>,
     ) -> ServiceResult<ProcessMetadataResponse> {
         let request = request.to_owned_message();
         tracing::info!("Received process_metadata request");
@@ -208,6 +243,24 @@ impl WellKnownTypesService for MyWellKnownTypesService {
         };
         Response::ok(response)
     }
+
+    async fn heartbeat(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, buffa_types::google::protobuf::Empty>,
+    ) -> ServiceResult<Timestamp> {
+        // Well-known types as the direct RPC input and output: the request
+        // parameter and response type come from buffa-types via extern_path,
+        // wrapped in the same ServiceRequest surface as local types.
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        Response::ok(Timestamp {
+            seconds: now.as_secs() as i64,
+            nanos: now.subsec_nanos() as i32,
+            ..Default::default()
+        })
+    }
 }
 
 async fn health() -> &'static str {
@@ -229,6 +282,12 @@ async fn main() {
     let connect_router = greet_service.register(ConnectRouter::new());
     let connect_router = math_service.register(connect_router);
     let connect_router = well_known_types_service.register(connect_router);
+
+    // Mount gRPC server reflection (v1 + v1alpha) so `grpcurl`, `buf curl`,
+    // Postman, and `grpcui` can discover and call the services above with
+    // no local proto files. The reflector is self-describing, so this is
+    // all the setup there is.
+    let connect_router = connectrpc_reflection::install(connect_router, build_reflector());
 
     tracing::info!("Registered RPC methods:");
     for method in connect_router.methods() {
