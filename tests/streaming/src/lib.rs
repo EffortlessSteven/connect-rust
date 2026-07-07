@@ -21,6 +21,33 @@ mod tests {
 
     const MSG_DELAY: Duration = Duration::from_millis(100);
 
+    /// Regression pin for issue #214: the `message()` futures must be `Send`
+    /// with CONCRETE generated view types, not just generic parameters — the
+    /// pre-fix bound shape (projecting `RespView::Owned` in the where-clause)
+    /// compiled generically but lost `Send` on monomorphization via rustc's
+    /// coroutine-witness auto-trait check. Compile-time-only assertion; never
+    /// called.
+    #[allow(dead_code)]
+    fn stream_message_futures_are_send<B>(
+        mut server_stream: connectrpc::client::ServerStream<B, EchoResponseView<'static>>,
+        mut bidi: connectrpc::client::BidiStream<B, EchoRequest, EchoResponseView<'static>>,
+    ) where
+        B: connectrpc::http_body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+        B::Error: std::fmt::Display,
+    {
+        fn assert_send<T: Send>(_: T) {}
+        // The async-block wrappers are load-bearing: asserting the bare
+        // `message()` future is Send passes even with the buggy bound —
+        // the failure only manifests in the ENCLOSING coroutine's witness,
+        // i.e. exactly the `tokio::spawn(async move { .. })` shape users hit.
+        assert_send(async move {
+            let _ = server_stream.message().await;
+        });
+        assert_send(async move {
+            let _ = bidi.message().await;
+        });
+    }
+
     /// Test echo service that echoes messages back with configurable delays.
     struct TestEchoService;
 
@@ -258,7 +285,7 @@ mod tests {
 
         while let Some(msg) = stream.message().await.unwrap() {
             let elapsed = start.elapsed();
-            received.push((msg.reborrow().sequence, elapsed));
+            received.push((msg.view().sequence, elapsed));
         }
 
         assert_eq!(received.len(), num_messages as usize);
@@ -696,7 +723,7 @@ mod tests {
 
         let mut got = Vec::new();
         while let Some(msg) = stream.message().await.unwrap() {
-            got.push((msg.reborrow().sequence, msg.reborrow().data.to_string()));
+            got.push((msg.view().sequence, msg.view().data.to_string()));
         }
         assert_eq!(
             got,
@@ -902,8 +929,8 @@ mod tests {
             let mut received = 0;
             while let Some(resp) = stream.message().await.unwrap() {
                 assert_eq!(
-                    resp.reborrow().data,
-                    format!("half-duplex-{}", resp.reborrow().sequence)
+                    resp.view().data,
+                    format!("half-duplex-{}", resp.view().sequence)
                 );
                 received += 1;
             }
@@ -1230,7 +1257,8 @@ mod tests {
     /// present (codegen dispatch is the only path where both are).
     #[tokio::test]
     async fn interceptor_wraps_unary_call() {
-        use connectrpc::{Interceptor, Next, UnaryRequest, UnaryResponse};
+        use connectrpc::interceptor::{UnaryRequest, UnaryResponse};
+        use connectrpc::{Interceptor, Next};
 
         /// Reads `path()` and `Spec`, echoes the path and request `data`
         /// field through response headers, and increments the response
@@ -1300,7 +1328,8 @@ mod tests {
     /// bypassed shape is a vulnerability, not a gap.
     #[tokio::test]
     async fn interceptor_wraps_streaming_calls() {
-        use connectrpc::{Interceptor, NextStream, PayloadStream, StreamRequest, StreamResponse};
+        use connectrpc::interceptor::{StreamRequest, StreamResponse};
+        use connectrpc::{Interceptor, NextStream, PayloadStream};
         use std::sync::Mutex;
 
         /// Records the path of every streaming RPC it sees and stamps a
@@ -1418,7 +1447,8 @@ mod tests {
     /// failure.
     #[tokio::test]
     async fn streaming_interceptor_short_circuit_reaches_client() {
-        use connectrpc::{Interceptor, NextStream, PayloadStream, StreamRequest, StreamResponse};
+        use connectrpc::interceptor::{StreamRequest, StreamResponse};
+        use connectrpc::{Interceptor, NextStream, PayloadStream};
 
         struct DenyAll;
         #[connectrpc::async_trait]

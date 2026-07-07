@@ -13,10 +13,11 @@ use std::collections::HashMap;
 use anyhow::Result;
 use heck::ToSnakeCase;
 use heck::ToUpperCamelCase;
-use proc_macro2::{Ident, TokenStream};
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::format_ident;
 use quote::quote;
 
+use buffa_codegen::generated::descriptor::DescriptorProto;
 use buffa_codegen::generated::descriptor::FileDescriptorProto;
 use buffa_codegen::generated::descriptor::MethodDescriptorProto;
 use buffa_codegen::generated::descriptor::ServiceDescriptorProto;
@@ -58,20 +59,72 @@ pub struct Options {
     /// [`generate_files`] (the unified `super::`-relative path).
     ///
     /// Every `extern_path` target must be buffa-generated code from
-    /// buffa ≥ 0.7.0 with views enabled (and, if the crate feature-gates
+    /// buffa ≥ 0.8.0 with views enabled (and, if the crate feature-gates
     /// its generated impls, with that feature turned on): the service
     /// stubs rely on the `buffa::HasMessageView` impls and `FooOwnedView`
     /// wrappers emitted alongside each message, the same way they rely on
-    /// the JSON/`Serialize` impls. `buffa-types` 0.7+ satisfies this for
+    /// the JSON/`Serialize` impls. `buffa-types` 0.8+ satisfies this for
     /// the well-known types. A crate generated without them fails to
     /// compile against the stubs (missing `HasMessageView` impl).
     pub buffa: CodeGenConfig,
 
     /// When `true`, prefix every emitted `FooClient<T>` struct and its
-    /// `impl` block with `#[cfg(feature = "client")]`. Opt in when
+    /// `impl` block with `#[cfg(feature = "...")]`. Opt in when
     /// the consuming crate wants to give server-only deployments a way
     /// to drop the client transport stack from their dependency graph.
     pub gate_client_feature: bool,
+
+    /// Cargo feature name used when [`Options::gate_client_feature`] is
+    /// enabled (default: `"client"`).
+    pub client_feature_name: String,
+
+    /// Which messages get generated `::connectrpc::Encodable` view impl
+    /// pairs (default: [`EncodableImpls::Outputs`], plugin opt
+    /// `encodable_impls=<all_messages|outputs>`).
+    ///
+    /// [`EncodableImpls::AllMessages`] emits the pair for **every message
+    /// defined in each targeted proto** and emits companion files even
+    /// for protos that declare no services. Use it in the generation run
+    /// of a crate that owns message types consumed by *other* crates'
+    /// services (a shared proto crate in a multi-crate split). Rust's
+    /// orphan rules require the `impl Encodable<M> for MView<'_>` blocks
+    /// to live in the crate that defines the view type, so a downstream
+    /// service crate cannot emit them itself — its stubs skip foreign
+    /// (`::`-rooted `extern_path`) types and handlers fall back to owned
+    /// returns or `PreEncoded::from_view`. With the impls in the owning
+    /// crate, those handlers can return views of the shared types
+    /// directly (proto codec only — like every view body, they answer
+    /// JSON-codec requests with `Unimplemented`).
+    ///
+    /// The emitting crate must depend on `connectrpc`, and the companion
+    /// files emitted for service-less packages must be mounted into the
+    /// module tree like any other plugin output — an unmounted companion
+    /// surfaces as a missing `Encodable` impl in the *consuming* crate.
+    /// Messages mapped away via
+    /// [`extern_paths`](CodeGenConfig::extern_paths) are skipped, but
+    /// only `::`-rooted targets are recognized as foreign — a
+    /// `crate::`-rooted re-export of another crate's types would still
+    /// get (orphan) impls. Synthetic map-entry messages never get impls.
+    ///
+    /// Enabling this in a service crate's own run is harmless (impls
+    /// dedup within one run), but do not enable it in two generation runs
+    /// that feed one crate and cover the same protos — each run emits its
+    /// own copy of the impls (E0119).
+    pub encodable_impls: EncodableImpls,
+}
+
+/// Which messages get generated `::connectrpc::Encodable` view impl
+/// pairs. See [`Options::encodable_impls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum EncodableImpls {
+    /// Emit the impl pair only for the RPC output types of the targeted
+    /// protos' services (the default).
+    #[default]
+    Outputs,
+    /// Emit the impl pair for every message defined in each targeted
+    /// proto, including protos that declare no services.
+    AllMessages,
 }
 
 impl Default for Options {
@@ -81,6 +134,8 @@ impl Default for Options {
         Self {
             buffa,
             gate_client_feature: false,
+            client_feature_name: "client".into(),
+            encodable_impls: EncodableImpls::default(),
         }
     }
 }
@@ -93,15 +148,37 @@ impl Options {
         config.generate_views = true;
         config
     }
+
+    fn client_feature_name(&self) -> Result<&str> {
+        let name = self.client_feature_name.trim();
+        if name.is_empty() {
+            if self.gate_client_feature {
+                anyhow::bail!("client feature name must not be empty");
+            }
+            return Ok("client");
+        }
+        if !buffa_codegen::FeatureGateNames::is_valid_name(name) {
+            anyhow::bail!(
+                "client feature name {name:?} is not a valid Cargo feature name \
+                 (must start with an alphanumeric or `_` and contain only \
+                 alphanumerics, `_`, `-`, `+`, `.`)"
+            );
+        }
+        Ok(name)
+    }
 }
 
 /// Emit one [`GeneratedFile`] per proto file in `file_to_generate` that
-/// declares at least one `service`. Files with no services produce no output.
+/// declares at least one `service`. Files with no services produce no
+/// output, unless [`Options::encodable_impls`] is [`EncodableImpls::AllMessages`] — then
+/// a file whose messages yield at least one `Encodable` impl pair gets a
+/// companion file too.
 fn emit_service_files(
     proto_file: &[FileDescriptorProto],
     file_to_generate: &[String],
     resolver: &TypeResolver<'_>,
-    gate_client_feature: bool,
+    options: &Options,
+    client_feature_name: &str,
 ) -> Result<Vec<GeneratedFile>> {
     let mut out = Vec::new();
     // Dedup state shared across the whole batch, not per file:
@@ -113,7 +190,9 @@ fn emit_service_files(
     //   because the stitcher mounts sibling files into one module.
     let mut batch = BatchState {
         colliding_aliases: collect_alias_collisions(proto_file, file_to_generate),
-        gate_client_feature,
+        gate_client_feature: options.gate_client_feature,
+        client_feature_name: client_feature_name.to_string(),
+        all_message_encodable_impls: options.encodable_impls == EncodableImpls::AllMessages,
         ..BatchState::default()
     };
     for file_name in file_to_generate {
@@ -122,9 +201,23 @@ fn emit_service_files(
             .find(|f| f.name.as_deref() == Some(file_name.as_str()));
 
         if let Some(file) = file_desc
-            && !file.service.is_empty()
+            && (!file.service.is_empty()
+                || (batch.all_message_encodable_impls && !file.message_type.is_empty()))
         {
             let service_tokens = generate_connect_services(file, resolver, &mut batch)?;
+            if service_tokens.is_empty() {
+                // `all_messages` mode, but every message in this proto was
+                // either already emitted from another file (dedup) or
+                // extern-mapped to a foreign crate: nothing to write. A
+                // service-declaring proto always yields tokens (the trait
+                // alone guarantees it) — assert that invariant so a future
+                // regression can't silently drop a whole companion here.
+                debug_assert!(
+                    file.service.is_empty(),
+                    "service-declaring proto {file_name} produced no service tokens"
+                );
+                continue;
+            }
             let service_code = format_token_stream(&service_tokens)?;
             // Companion files are connect-rust's contribution alongside
             // buffa's per-proto outputs. The `.__connect.rs` suffix avoids
@@ -154,7 +247,10 @@ fn emit_service_files(
 /// ViewOneof, Ext, plus one PackageMod stitcher per package), with one
 /// [`GeneratedFileKind::Companion`] file per service-declaring proto
 /// (`<stem>.__connect.rs`) wired into the matching package stitcher via
-/// [`buffa_codegen::apply_companions`]. Callers write every file to disk
+/// [`buffa_codegen::apply_companions`]. Under
+/// [`EncodableImpls::AllMessages`], protos without services also get a
+/// companion (Encodable impls only) when at least one of their messages
+/// yields an impl pair. Callers write every file to disk
 /// and wire only the [`GeneratedFileKind::PackageMod`] entries into their
 /// module tree (the stitchers `include!` the rest).
 ///
@@ -183,11 +279,13 @@ pub fn generate_files(
         .map_err(|e| anyhow::anyhow!("buffa-codegen failed: {e}"))?;
 
     let resolver = TypeResolver::new(proto_file, file_to_generate, &config, false);
+    let client_feature_name = options.client_feature_name()?;
     let service_files = emit_service_files(
         proto_file,
         file_to_generate,
         &resolver,
-        options.gate_client_feature,
+        options,
+        client_feature_name,
     )?;
 
     if config.file_per_package {
@@ -276,8 +374,10 @@ fn inline_companions_into_package_mods(
 /// Generate **only** ConnectRPC service bindings from proto descriptors.
 ///
 /// Returns one `<stem>.__connect.rs` `GeneratedFile` per proto file in
-/// `file_to_generate` that declares at least one `service`, plus one
-/// `<pkg>.mod.rs` stitcher per package. No message types.
+/// `file_to_generate` that declares at least one `service` — plus, under
+/// [`EncodableImpls::AllMessages`], per proto whose messages yield at
+/// least one `Encodable` impl pair — and one `<pkg>.mod.rs` stitcher per
+/// package with output. No message types.
 ///
 /// Service files carry [`GeneratedFileKind::Companion`] for symmetry with
 /// [`generate_files`], even though this path never calls
@@ -316,11 +416,13 @@ pub fn generate_services(
 
     let config = options.to_buffa_config();
     let resolver = TypeResolver::new(proto_file, file_to_generate, &config, true);
+    let client_feature_name = options.client_feature_name()?;
     let mut files = emit_service_files(
         proto_file,
         file_to_generate,
         &resolver,
-        options.gate_client_feature,
+        options,
+        client_feature_name,
     )?;
 
     if config.file_per_package {
@@ -386,7 +488,9 @@ pub fn generate_services(
 /// # Output
 ///
 /// Per proto with at least one `service`: a `<stem>.__connect.rs` content
-/// file with the service stubs. Per package with at least one such proto:
+/// file with the service stubs. Under `encodable_impls=all_messages`,
+/// also per proto whose messages yield at least one `Encodable` impl
+/// pair. Per package with at least one such proto:
 /// a `<pkg>.mod.rs` stitcher that `include!`s the content files. The
 /// stitcher filename intentionally matches `protoc-gen-buffa`'s, so run
 /// this plugin into a separate output directory and use
@@ -435,9 +539,9 @@ pub fn generate_services(
 ///   `extern_path=.=<path>` is the catch-all (equivalent to `buffa_module`).
 ///   At least one catch-all mapping is required so every type resolves.
 ///   Every mapped path must point at buffa-generated code from
-///   buffa ≥ 0.7.0 with views enabled — the stubs use the
+///   buffa ≥ 0.8.0 with views enabled — the stubs use the
 ///   `buffa::HasMessageView` impls and owned-view wrappers generated with
-///   each message (`buffa-types` 0.7+ qualifies for the well-known types).
+///   each message (`buffa-types` 0.8+ qualifies for the well-known types).
 /// - `file_per_package` — emit one `<dotted.pkg>.rs` per proto package
 ///   instead of the per-proto split + stitcher. Set `protoc-gen-buffa`'s
 ///   own `file_per_package` option to the same value — the BSR/`tonic`
@@ -450,8 +554,10 @@ pub fn generate_services(
 ///   [`CodeGenConfig::file_per_package`] for the `strategy: directory`
 ///   constraint.
 /// - `strict_utf8_mapping` — see [`CodeGenConfig::strict_utf8_mapping`].
-/// - `no_json` — disable `serde` derives on generated message types.
-///   Ignored in this plugin (no message types emitted); accepted for
+/// - `no_json` — disable `serde` derives on generated message types, for
+///   proto-only builds. Pair it with `connectrpc`'s `default-features = false`
+///   (the `json` cargo feature off) so the runtime drops its matching serde
+///   bounds. Ignored in this plugin (no message types emitted); accepted for
 ///   compatibility with the unified path.
 /// - `no_register_fn` — suppress the per-file
 ///   `register_types(&mut TypeRegistry)` aggregator. See
@@ -459,11 +565,31 @@ pub fn generate_services(
 ///   types emitted); accepted for compatibility with the unified path.
 /// - `gate_client_feature` — prefix every emitted `FooClient<T>`
 ///   struct and its `impl` block with `#[cfg(feature = "client")]`.
+/// - `gate_client_feature=<name>` — same gate, but use `<name>` as the
+///   Cargo feature instead of `client`.
+/// - `encodable_impls=all_messages` — emit the `::connectrpc::Encodable`
+///   view impl pair for every message defined in each targeted proto, not
+///   only for RPC output types, and emit a companion file even for protos
+///   that declare no services. Use this in the generation run of a crate
+///   that owns message types consumed by *other* crates' services (a
+///   shared proto crate in a multi-crate split): Rust's orphan rules
+///   require these impls to live in the crate that defines the view
+///   types, so downstream service crates skip them and their handlers
+///   would otherwise have to return owned messages or
+///   `PreEncoded::from_view`. (View bodies serve the proto codec only —
+///   JSON-codec requests get `Unimplemented`, as for any view body.)
+///   The emitting crate must depend on `connectrpc`, and the companion
+///   files for service-less packages must be mounted like any other
+///   plugin output — an unmounted companion surfaces as a missing
+///   `Encodable` impl in the *consuming* crate. Messages mapped to a
+///   foreign crate via `extern_path` are still skipped.
+///   `encodable_impls=outputs` is the explicit default. See
+///   [`Options::encodable_impls`].
 ///
 /// # Client-side cfg gate
 ///
 /// When `gate_client_feature` is set, the consumer crate must declare
-/// a Cargo feature literally named `client`. Without it, the generated
+/// the named Cargo feature (`client` by default). Without it, the generated
 /// `FooClient` items will be absent from the crate namespace.
 ///
 /// Two consumer patterns:
@@ -518,6 +644,22 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                     proto.insert(0, '.');
                 }
                 options.buffa.extern_paths.push((proto, rust.to_string()));
+            } else if let Some(value) = opt.strip_prefix("gate_client_feature=") {
+                let feature = value.trim();
+                if feature.is_empty() {
+                    anyhow::bail!("gate_client_feature requires a non-empty feature name");
+                }
+                options.gate_client_feature = true;
+                options.client_feature_name = feature.to_string();
+            } else if let Some(value) = opt.strip_prefix("encodable_impls=") {
+                match value.trim() {
+                    "all_messages" => options.encodable_impls = EncodableImpls::AllMessages,
+                    "outputs" => options.encodable_impls = EncodableImpls::Outputs,
+                    other => anyhow::bail!(
+                        "invalid encodable_impls value {other:?}, expected \
+                         `all_messages` or `outputs`"
+                    ),
+                }
             } else {
                 match opt {
                     "file_per_package" => options.buffa.file_per_package = true,
@@ -529,8 +671,10 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                         return Err(anyhow::anyhow!(
                             "unknown plugin option: {opt:?}. Supported: \
                              buffa_module=<rust_path>, extern_path=<proto>=<rust>, \
+                             encodable_impls=<all_messages|outputs>, \
                              file_per_package, strict_utf8_mapping, no_json, \
-                             no_register_fn, gate_client_feature"
+                             no_register_fn, gate_client_feature, \
+                             gate_client_feature=<name>"
                         ));
                     }
                 }
@@ -759,10 +903,26 @@ struct BatchState {
     colliding_aliases: std::collections::BTreeSet<(String, String)>,
     /// Mirrors [`Options::gate_client_feature`]. When `true`, prefix
     /// each emitted `FooClient<T>` struct + `impl` with
-    /// `#[cfg(feature = "client")]`. Threaded here so it propagates
+    /// `#[cfg(feature = "...")]`. Threaded here so it propagates
     /// through the per-file emission loop without changing every
     /// helper's signature.
     gate_client_feature: bool,
+    /// Mirrors [`Options::client_feature_name`].
+    client_feature_name: String,
+    /// Mirrors [`Options::encodable_impls`] == `AllMessages`. Threaded here so
+    /// it propagates through the per-file emission loop without changing
+    /// every helper's signature.
+    all_message_encodable_impls: bool,
+}
+
+impl BatchState {
+    fn client_feature_name(&self) -> &str {
+        if self.client_feature_name.is_empty() {
+            "client"
+        } else {
+            &self.client_feature_name
+        }
+    }
 }
 
 fn generate_connect_services(
@@ -783,6 +943,9 @@ fn generate_connect_services(
     // `StreamMessage` to be usable.
     tokens.extend(generate_owned_view_aliases(file, resolver, batch)?);
     tokens.extend(generate_encodable_view_impls(file, resolver, batch)?);
+    if batch.all_message_encodable_impls {
+        tokens.extend(generate_all_message_encodable_impls(file, resolver, batch)?);
+    }
 
     for service in &file.service {
         tokens.extend(generate_service(file, service, resolver, batch)?);
@@ -816,7 +979,7 @@ fn alias_collides(batch: &BatchState, current_package: &str, proto_fqn: &str) ->
 /// input type, including ones mapped via `extern_path`: the backing
 /// `buffa::HasMessageView` impl is emitted by buffa's codegen in the crate
 /// that owns the type (`extern_path` targets are required to be generated
-/// with buffa ≥ 0.7.0 and views enabled).
+/// with buffa ≥ 0.8.0 and views enabled).
 fn router_stream_items_tokens(
     resolver: &TypeResolver<'_>,
     method: &MethodDescriptorProto,
@@ -857,16 +1020,16 @@ fn stream_items_doc(method: &MethodDescriptorProto) -> TokenStream {
     doc
 }
 
-/// Inbound stream item type for a client-streaming / bidi RPC:
-/// `StreamMessage<Req>` keyed by the owned message.
-fn stream_item_arg(
+/// Owned message type of a client-streaming / bidi RPC's inbound items;
+/// the trait signature wraps it as `InboundStream<Req>`.
+fn stream_owned_message_type(
     resolver: &TypeResolver<'_>,
     method: &MethodDescriptorProto,
     package: &str,
 ) -> Result<TokenStream> {
     let input_fqn = method.input_type.as_deref().unwrap_or("");
     let input_owned = resolver.rust_type(input_fqn, package)?;
-    Ok(quote! { ::connectrpc::StreamMessage<#input_owned> })
+    Ok(quote! { #input_owned })
 }
 
 /// Walk every service's method input/output FQNs across `file_to_generate`
@@ -1002,34 +1165,103 @@ fn generate_encodable_view_impls(
     for service in &file.service {
         for m in &service.method {
             let fqn = m.output_type.as_deref().unwrap_or("");
-            if !batch.encodable_seen.insert(fqn.to_string()) {
-                continue;
+            if let Some(impls) = encodable_impl_pair(fqn, package, resolver, batch)? {
+                out.extend(impls);
             }
-            let path = resolver.resolve_path(fqn, package)?;
-            // Skip foreign types (extern_path → `::crate_name::...`): the
-            // impl would be an orphan in the user's crate.
-            if path.starts_with("::") {
-                continue;
-            }
-            let owned = resolver.rust_type(fqn, package)?;
-            let view = resolver.rust_view_type(fqn, package)?;
-            out.extend(quote! {
-                impl ::connectrpc::Encodable<#owned> for #view<'_> {
-                    fn encode(&self, codec: ::connectrpc::CodecFormat)
-                        -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError>
-                    {
-                        ::connectrpc::__codegen::encode_view_body(self, codec)
-                    }
-                }
-                impl ::connectrpc::Encodable<#owned> for ::buffa::view::OwnedView<#view<'static>> {
-                    fn encode(&self, codec: ::connectrpc::CodecFormat)
-                        -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError>
-                    {
-                        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
-                    }
-                }
-            });
         }
+    }
+    Ok(out)
+}
+
+/// Emit the `Encodable<M>` impl pair (plain view + `OwnedView`) for one
+/// message FQN, or `None` when the pair was already emitted in this batch
+/// or the type resolves to a foreign (`::`-rooted `extern_path`) crate —
+/// there the impl would be an orphan.
+fn encodable_impl_pair(
+    fqn: &str,
+    package: &str,
+    resolver: &TypeResolver<'_>,
+    batch: &mut BatchState,
+) -> Result<Option<TokenStream>> {
+    if !batch.encodable_seen.insert(fqn.to_string()) {
+        return Ok(None);
+    }
+    let path = resolver.resolve_path(fqn, package)?;
+    // Skip foreign types (extern_path → `::crate_name::...`): the
+    // impl would be an orphan in the user's crate.
+    if path.starts_with("::") {
+        return Ok(None);
+    }
+    let owned = resolver.rust_type(fqn, package)?;
+    let view = resolver.rust_view_type(fqn, package)?;
+    Ok(Some(quote! {
+        impl ::connectrpc::Encodable<#owned> for #view<'_> {
+            fn encode(&self, codec: ::connectrpc::CodecFormat)
+                -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError>
+            {
+                ::connectrpc::__codegen::encode_view_body(self, codec)
+            }
+        }
+        impl ::connectrpc::Encodable<#owned> for ::buffa::view::OwnedView<#view<'static>> {
+            fn encode(&self, codec: ::connectrpc::CodecFormat)
+                -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError>
+            {
+                ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+            }
+        }
+    }))
+}
+
+/// Emit `Encodable<M>` view impl pairs for **every message defined in
+/// `file`** (recursing into nested messages, skipping synthetic map
+/// entries), deduped through `batch.encodable_seen` against the
+/// service-output-driven emission in [`generate_encodable_view_impls`].
+///
+/// Driven by [`EncodableImpls::AllMessages`]: in a multi-crate
+/// layout this runs in the crate that owns the messages, so other crates'
+/// service stubs (which must skip these foreign types — orphan rules) can
+/// still hand views of them to the response path.
+fn generate_all_message_encodable_impls(
+    file: &FileDescriptorProto,
+    resolver: &TypeResolver<'_>,
+    batch: &mut BatchState,
+) -> Result<TokenStream> {
+    fn recurse(
+        msg: &DescriptorProto,
+        fqn_prefix: &str,
+        package: &str,
+        resolver: &TypeResolver<'_>,
+        batch: &mut BatchState,
+        out: &mut TokenStream,
+    ) -> Result<()> {
+        // Synthetic map-entry messages have no generated Rust type.
+        if msg
+            .options
+            .as_option()
+            .is_some_and(|o| o.map_entry.unwrap_or(false))
+        {
+            return Ok(());
+        }
+        let name = msg.name.as_deref().unwrap_or("");
+        let fqn = format!("{fqn_prefix}.{name}");
+        if let Some(impls) = encodable_impl_pair(&fqn, package, resolver, batch)? {
+            out.extend(impls);
+        }
+        for nested in &msg.nested_type {
+            recurse(nested, &fqn, package, resolver, batch, out)?;
+        }
+        Ok(())
+    }
+
+    let package = file.package.as_deref().unwrap_or("");
+    let fqn_prefix = if package.is_empty() {
+        String::new()
+    } else {
+        format!(".{package}")
+    };
+    let mut out = TokenStream::new();
+    for msg in &file.message_type {
+        recurse(msg, &fqn_prefix, package, resolver, batch, &mut out)?;
     }
     Ok(out)
 }
@@ -1088,6 +1320,7 @@ fn generate_service(
         format_ident!("{}", service_upper)
     };
     let ext_trait_name = format_ident!("{}Ext", service_upper);
+    let register_marker_name = format_ident!("{}RegisterMarker", service_upper);
     let client_name = format_ident!("{}Client", service_upper);
     let server_name = format_ident!("{}Server", service_upper);
     let service_name_const = format_ident!(
@@ -1117,7 +1350,8 @@ fn generate_service(
          call `request.to_owned_message()` (or copy the specific fields)\n\
          first.\n\n\
          **Client-streaming and bidi requests** arrive as\n\
-         `ServiceStream<`[`StreamMessage<Req>`](::connectrpc::StreamMessage)`>`.\n\
+         [`InboundStream<Req>`](::connectrpc::InboundStream) — a\n\
+         `ServiceStream` of [`StreamMessage`](::connectrpc::StreamMessage)s.\n\
          Each item owns its decoded buffer and is `Send + 'static`, so items\n\
          can be buffered or moved into spawned tasks; read fields zero-copy\n\
          through the generated accessor methods (`item.name()`) or `.view()`,\n\
@@ -1125,7 +1359,7 @@ fn generate_service(
          `StreamMessage<M>` implements `Encodable<M>`.\n\n\
          Request types resolved through `extern_path` (e.g. well-known types\n\
          from another crate) use the same wrappers; the crate that owns the\n\
-         type must be generated with buffa ≥ 0.7.0 and views enabled so the\n\
+         type must be generated with buffa ≥ 0.8.0 and views enabled so the\n\
          backing `HasMessageView` impl exists.\n\n\
          The `impl Encodable<Out>` return bound accepts the owned `Out`, the\n\
          generated `OutView<'_>` / `OwnedOutView`,\n\
@@ -1388,12 +1622,13 @@ let owned = client.{example_method}(request).await?.into_owned();
 
 [`into_view()`](::connectrpc::client::UnaryResponse::into_view) keeps the
 zero-copy decoded body (an `OwnedView`) without copying; field access on it
-goes through `.reborrow()`. Streaming responses yield one `OwnedView` per
-received message from `.message().await` — bind `msg.reborrow()` for field
-access, or convert with `.to_owned_message()`."#
+goes through `.reborrow()`. Streaming responses yield one
+[`StreamMessage`](::connectrpc::StreamMessage) per received message from
+`.message().await` — read fields zero-copy through the generated accessor
+methods (`msg.name()`) or `.view()`, or convert with `.to_owned_message()`."#
     );
     let client_doc_tokens = doc_attrs(&client_doc);
-    // Opt-in `#[cfg(feature = "client")]` on every client-side item.
+    // Opt-in feature cfg on every client-side item.
     //
     // INVARIANT: any future emission referencing
     // `::connectrpc::client::*` (an additional `impl`, a free fn, a
@@ -1401,7 +1636,8 @@ access, or convert with `.to_owned_message()`."#
     // The `no_ungated_client_references` test enforces this by scanning
     // the formatted output under the opt-in path.
     let client_cfg_attr: TokenStream = if batch.gate_client_feature {
-        quote! { #[cfg(feature = "client")] }
+        let feature_name = syn::LitStr::new(batch.client_feature_name(), Span::call_site());
+        quote! { #[cfg(feature = #feature_name)] }
     } else {
         TokenStream::new()
     };
@@ -1430,6 +1666,9 @@ access, or convert with `.to_owned_message()`."#
         /// Extension trait for registering a service implementation with a Router.
         ///
         /// This trait is automatically implemented for all types that implement the service trait.
+        /// Prefer [`Router::add_service`](::connectrpc::Router::add_service) for
+        /// top-down registration; `register` remains available for compatibility
+        /// and cases where the service-first call shape is more convenient.
         ///
         /// # Example
         ///
@@ -1454,6 +1693,18 @@ access, or convert with `.to_owned_message()`."#
             }
         }
 
+        /// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
+        #[doc(hidden)]
+        pub struct #register_marker_name;
+
+        impl<S: #trait_name> ::connectrpc::ServiceRegister<#register_marker_name>
+            for ::std::sync::Arc<S>
+        {
+            fn register_service(self, router: ::connectrpc::Router) -> ::connectrpc::Router {
+                <S as #ext_trait_name>::register(self, router)
+            }
+        }
+
         #service_server
 
         #client_doc_tokens
@@ -1468,7 +1719,7 @@ access, or convert with `.to_owned_message()`."#
         impl<T> #client_name<T>
         where
             T: ::connectrpc::client::ClientTransport,
-            <T::ResponseBody as ::http_body::Body>::Error: ::std::fmt::Display,
+            <T::ResponseBody as ::connectrpc::http_body::Body>::Error: ::std::fmt::Display,
         {
             /// Create a new client with the given transport and configuration.
             pub fn new(transport: T, config: ::connectrpc::client::ClientConfig) -> Self {
@@ -1888,7 +2139,7 @@ fn generate_trait_method(
         // `.view()`, conversion via `.to_owned_message()`, and — for
         // echo-shaped methods — items can be forwarded as-is since
         // `StreamMessage<M>: Encodable<M>`).
-        let stream_item_arg = stream_item_arg(resolver, method, package)?;
+        let stream_owned = stream_owned_message_type(resolver, method, package)?;
         let items_doc = stream_items_doc(method);
         Ok(quote! {
             #method_doc_tokens
@@ -1897,14 +2148,14 @@ fn generate_trait_method(
             fn #method_snake<'a>(
                 &'a self,
                 ctx: ::connectrpc::RequestContext,
-                requests: ::connectrpc::ServiceStream<#stream_item_arg>,
+                requests: ::connectrpc::InboundStream<#stream_owned>,
             ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<impl ::connectrpc::Encodable<#output_type> + Send + use<'a, Self>>> + Send;
         })
     } else if client_streaming && server_streaming {
         // Bidi streaming method. Same `impl Encodable<...>` item type and
         // `use<Self>` capture clause as server streaming above; inbound items
         // are `StreamMessage<Req>` as for client streaming.
-        let stream_item_arg = stream_item_arg(resolver, method, package)?;
+        let stream_owned = stream_owned_message_type(resolver, method, package)?;
         let items_doc = stream_items_doc(method);
         Ok(quote! {
             #method_doc_tokens
@@ -1912,7 +2163,7 @@ fn generate_trait_method(
             fn #method_snake(
                 &self,
                 ctx: ::connectrpc::RequestContext,
-                requests: ::connectrpc::ServiceStream<#stream_item_arg>,
+                requests: ::connectrpc::InboundStream<#stream_owned>,
             ) -> impl ::std::future::Future<Output = ::connectrpc::ServiceResult<::connectrpc::ServiceStream<impl ::connectrpc::Encodable<#output_type> + Send + use<Self>>>> + Send;
         })
     } else {
@@ -2464,7 +2715,7 @@ mod tests {
         );
         // `.google.protobuf.Empty` resolves through the default extern_path to
         // `::buffa_types::…`. extern_path targets are required to be
-        // buffa ≥ 0.7.0 generated code with views enabled, so the unary input
+        // buffa ≥ 0.8.0 generated code with views enabled, so the unary input
         // uses the same `ServiceRequest<'_, Req>` form as local types — the
         // backing `buffa::HasMessageView` impl ships with buffa-types.
         assert!(
@@ -2550,15 +2801,13 @@ mod tests {
                 >= 2,
             "unary and server-streaming should take the borrowed ServiceRequest form: {code}"
         );
-        // Client-streaming and bidi inbound items are StreamMessage<Req> keyed
+        // Client-streaming and bidi inbound items are InboundStream<Req> keyed
         // by the owned message — the alias collision is irrelevant to them.
         assert!(
-            code.matches(
-                "requests : :: connectrpc :: ServiceStream < :: connectrpc :: StreamMessage <"
-            )
-            .count()
+            code.matches("requests : :: connectrpc :: InboundStream <")
+                .count()
                 >= 2,
-            "client-streaming and bidi should both take StreamMessage items: {code}"
+            "client-streaming and bidi should both take InboundStream items: {code}"
         );
     }
 
@@ -3440,6 +3689,13 @@ mod tests {
     /// whether the opt-in cfg attr is emitted; shared by the `*_client_*`
     /// tests below.
     fn format_minimal_service(gate_client_feature: bool) -> String {
+        format_minimal_service_with_client_feature_name(gate_client_feature, "client")
+    }
+
+    fn format_minimal_service_with_client_feature_name(
+        gate_client_feature: bool,
+        client_feature_name: &str,
+    ) -> String {
         let file = minimal_file(
             Some("example.v1"),
             ".example.v1.PingReq",
@@ -3453,6 +3709,7 @@ mod tests {
         let batch = BatchState {
             colliding_aliases: collect_alias_collisions(std::slice::from_ref(&file), &target),
             gate_client_feature,
+            client_feature_name: client_feature_name.to_string(),
             ..BatchState::default()
         };
         format_token_stream(&generate_service(&file, service, &resolver, &batch).unwrap()).unwrap()
@@ -3490,6 +3747,22 @@ mod tests {
     }
 
     #[test]
+    fn client_items_use_custom_feature_name_when_configured() {
+        let out = format_minimal_service_with_client_feature_name(true, "grpc-client");
+        let cfg_count = out.matches("#[cfg(feature = \"grpc-client\")]").count();
+        assert_eq!(
+            cfg_count, 2,
+            "expected exactly two #[cfg(feature = \"grpc-client\")] attrs \
+             (one on `pub struct PingServiceClient`, one on its `impl<T>` \
+             block); got {cfg_count}:\n{out}"
+        );
+        assert!(
+            !out.contains("#[cfg(feature = \"client\")]"),
+            "custom feature name must replace the default `client` gate:\n{out}"
+        );
+    }
+
+    #[test]
     fn server_items_never_carry_client_cfg() {
         // The trait, ext trait, and monomorphic dispatcher live on the
         // server side; nothing about them should be feature-gated even
@@ -3498,6 +3771,7 @@ mod tests {
         for marker in [
             "pub trait PingService",
             "pub trait PingServiceExt",
+            "pub struct PingServiceRegisterMarker",
             "pub struct PingServiceServer",
             "pub const PING_SERVICE_SERVICE_NAME",
         ] {
@@ -3511,6 +3785,33 @@ mod tests {
                  server-side items are always compiled in:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn service_register_impl_and_marker_are_generated() {
+        let out = format_minimal_service(false);
+        assert!(
+            out.contains("pub struct PingServiceRegisterMarker;"),
+            "generated service must expose an inference marker:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "impl<S: PingService> ::connectrpc::ServiceRegister<PingServiceRegisterMarker>"
+            ),
+            "generated service must implement ServiceRegister for Arc<S>:\n{out}"
+        );
+        assert!(
+            out.contains("for ::std::sync::Arc<S>"),
+            "ServiceRegister implementation must accept Arc<S>:\n{out}"
+        );
+        assert!(
+            out.contains("fn register_service(self, router: ::connectrpc::Router)"),
+            "ServiceRegister implementation must expose the bridge method:\n{out}"
+        );
+        assert!(
+            out.contains("<S as PingServiceExt>::register(self, router)"),
+            "ServiceRegister must forward to the existing extension trait:\n{out}"
+        );
     }
 
     /// The strongest invariant: every reference to
@@ -3849,11 +4150,438 @@ mod tests {
     }
 
     #[test]
+    fn plugin_accepts_gate_client_feature_value_form() {
+        let file = minimal_file(
+            Some("example.v1"),
+            ".example.v1.PingReq",
+            ".example.v1.PingResp",
+            &["PingReq", "PingResp"],
+        );
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,gate_client_feature=grpc-client".into()),
+            file_to_generate: vec!["ping.proto".into()],
+            proto_file: vec![file],
+            ..Default::default()
+        };
+        let response =
+            generate(&request).expect("custom gate_client_feature value should be recognized");
+        let connect_file = response
+            .file
+            .iter()
+            .find(|f| f.name.as_deref() == Some("ping.__connect.rs"))
+            .expect("plugin should emit a connect service companion");
+        let content = connect_file.content.as_deref().unwrap_or_default();
+        let cfg_count = content.matches("#[cfg(feature = \"grpc-client\")]").count();
+        assert_eq!(
+            cfg_count, 2,
+            "expected custom feature gate on generated client struct and impl; got \
+             {cfg_count}:\n{content}"
+        );
+        assert!(
+            !content.contains("#[cfg(feature = \"client\")]"),
+            "custom plugin feature name must replace the default gate:\n{content}"
+        );
+    }
+
+    #[test]
+    fn plugin_rejects_empty_gate_client_feature_value() {
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,gate_client_feature=".into()),
+            file_to_generate: vec![],
+            proto_file: vec![],
+            ..Default::default()
+        };
+        let err = generate(&request).expect_err("empty gate_client_feature value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gate_client_feature requires a non-empty feature name"),
+            "error should describe the empty feature-name problem: {msg}"
+        );
+    }
+
+    #[test]
+    fn options_reject_invalid_client_feature_name() {
+        let opts = Options {
+            gate_client_feature: true,
+            client_feature_name: "grpc client".into(),
+            ..Options::default()
+        };
+        let err = generate_services(&[], &[], &opts)
+            .expect_err("invalid client feature name must be rejected");
+        assert!(
+            err.to_string().contains("not a valid Cargo feature name"),
+            "error should name the grammar problem: {err}"
+        );
+    }
+
+    /// Split-path options with `EncodableImpls::AllMessages` and the
+    /// `.` → `crate::proto` catch-all, mirroring a types-crate generation
+    /// run; `extra_extern` prepends higher-priority package mappings.
+    fn all_messages_options(extra_extern: &[(&str, &str)]) -> Options {
+        let mut options = Options {
+            encodable_impls: EncodableImpls::AllMessages,
+            ..Options::default()
+        };
+        for (proto, rust) in extra_extern {
+            options
+                .buffa
+                .extern_paths
+                .push(((*proto).into(), (*rust).into()));
+        }
+        options
+            .buffa
+            .extern_paths
+            .push((".".into(), "crate::proto".into()));
+        options
+    }
+
+    #[test]
+    fn all_messages_emits_impls_for_serviceless_proto() {
+        let file = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Shared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let generated = generate_services(
+            std::slice::from_ref(&file),
+            &["common.proto".into()],
+            &all_messages_options(&[]),
+        )
+        .unwrap();
+
+        let companion = generated
+            .iter()
+            .find(|f| f.name == "common.__connect.rs")
+            .expect("service-less proto must get a companion under all_messages");
+        assert_eq!(
+            companion
+                .content
+                .matches("impl ::connectrpc::Encodable<")
+                .count(),
+            2,
+            "one view + one OwnedView impl: {}",
+            companion.content
+        );
+        assert!(
+            companion.content.contains("SharedView"),
+            "impls must target the view type: {}",
+            companion.content
+        );
+        // The package stitcher must wire the companion in.
+        let stitcher = generated
+            .iter()
+            .find(|f| f.kind == GeneratedFileKind::PackageMod)
+            .expect("package stitcher for the companion");
+        assert!(
+            stitcher
+                .content
+                .contains("include!(\"common.__connect.rs\")"),
+            "stitcher must include the companion: {}",
+            stitcher.content
+        );
+    }
+
+    #[test]
+    fn all_messages_skips_extern_mapped_proto_entirely() {
+        // The whole package is mapped to a foreign crate: every impl would
+        // be an orphan there, so no impls — and no empty companion file.
+        let file = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Shared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let generated = generate_services(
+            std::slice::from_ref(&file),
+            &["common.proto".into()],
+            &all_messages_options(&[(".common.v1", "::common_protos::proto::common::v1")]),
+        )
+        .unwrap();
+        assert!(
+            generated.is_empty(),
+            "foreign-mapped proto must produce no files: {:?}",
+            generated.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn all_messages_dedups_with_service_output_impls() {
+        // PingResp is both an RPC output (outputs-driven emission) and a
+        // file-local message (all-messages emission): exactly one impl
+        // pair must survive, plus PingReq's pair from all-messages.
+        let file = minimal_file(
+            Some("example.v1"),
+            ".example.v1.PingReq",
+            ".example.v1.PingResp",
+            &["PingReq", "PingResp"],
+        );
+        let generated = generate_services(
+            std::slice::from_ref(&file),
+            &["ping.proto".into()],
+            &all_messages_options(&[]),
+        )
+        .unwrap();
+        let companion = generated
+            .iter()
+            .find(|f| f.name == "ping.__connect.rs")
+            .expect("service companion");
+        // Count impl bodies (one `encode_view_body` call each) rather than
+        // `impl ::connectrpc::Encodable<` — that string also appears in the
+        // trait method's return-position bound.
+        assert_eq!(
+            companion.content.matches("encode_view_body").count(),
+            4,
+            "exactly one impl pair per message (PingReq + PingResp), \
+             no E0119 duplicates: {}",
+            companion.content
+        );
+        assert!(companion.content.contains("PingReqView"));
+        assert!(companion.content.contains("PingRespView"));
+    }
+
+    #[test]
+    fn all_messages_recurses_nested_and_skips_map_entries() {
+        use buffa_codegen::generated::descriptor::MessageOptions;
+        let file = FileDescriptorProto {
+            name: Some("nested.proto".into()),
+            package: Some("example.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Outer".into()),
+                nested_type: vec![
+                    DescriptorProto {
+                        name: Some("Inner".into()),
+                        ..Default::default()
+                    },
+                    DescriptorProto {
+                        name: Some("LabelsEntry".into()),
+                        options: buffa::MessageField::some(MessageOptions {
+                            map_entry: Some(true),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let generated = generate_services(
+            std::slice::from_ref(&file),
+            &["nested.proto".into()],
+            &all_messages_options(&[]),
+        )
+        .unwrap();
+        let companion = generated
+            .iter()
+            .find(|f| f.name == "nested.__connect.rs")
+            .expect("companion with nested-message impls");
+        assert_eq!(
+            companion
+                .content
+                .matches("impl ::connectrpc::Encodable<")
+                .count(),
+            4,
+            "impl pairs for Outer and Outer.Inner only: {}",
+            companion.content
+        );
+        assert!(
+            companion.content.contains("InnerView"),
+            "nested message must get impls: {}",
+            companion.content
+        );
+        assert!(
+            !companion.content.contains("LabelsEntry"),
+            "synthetic map entries must not get impls: {}",
+            companion.content
+        );
+    }
+
+    #[test]
+    fn all_messages_file_per_package_collapses_serviceless_output() {
+        // Split path + file_per_package: a service-less proto's impls must
+        // land in the single `<dotted.pkg>.rs` PackageMod, with no
+        // companion or stitcher siblings.
+        let file = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Shared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut options = all_messages_options(&[]);
+        options.buffa.file_per_package = true;
+        let generated = generate_services(
+            std::slice::from_ref(&file),
+            &["common.proto".into()],
+            &options,
+        )
+        .unwrap();
+        assert_eq!(generated.len(), 1, "exactly one PackageMod file");
+        let pkg_mod = &generated[0];
+        assert_eq!(pkg_mod.kind, GeneratedFileKind::PackageMod);
+        assert_eq!(pkg_mod.name, "common.v1.rs");
+        assert_eq!(
+            pkg_mod.content.matches("encode_view_body").count(),
+            2,
+            "impl pair inlined into the package file: {}",
+            pkg_mod.content
+        );
+    }
+
+    #[test]
+    fn generate_files_all_messages_file_per_package_inlines_serviceless_impls() {
+        // Unified path + file_per_package: the service-less proto's impls
+        // must be inlined into buffa's `<dotted.pkg>.rs` PackageMod (this
+        // is the first flow that reaches the inlining helper with a
+        // package that has no services).
+        let file = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Shared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut options = Options {
+            encodable_impls: EncodableImpls::AllMessages,
+            ..Options::default()
+        };
+        options.buffa.file_per_package = true;
+        let generated = generate_files(
+            std::slice::from_ref(&file),
+            &["common.proto".into()],
+            &options,
+        )
+        .unwrap();
+        assert!(
+            !generated
+                .iter()
+                .any(|f| f.kind == GeneratedFileKind::Companion),
+            "file_per_package must not leave sibling Companion files"
+        );
+        let pkg_mod = generated
+            .iter()
+            .find(|f| f.kind == GeneratedFileKind::PackageMod && f.package == "common.v1")
+            .expect("PackageMod for common.v1");
+        assert_eq!(
+            pkg_mod.content.matches("encode_view_body").count(),
+            2,
+            "impl pair inlined into the package file: {}",
+            pkg_mod.content
+        );
+    }
+
+    #[test]
+    fn plugin_accepts_encodable_impls_option() {
+        let file = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Shared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,encodable_impls=all_messages".into()),
+            file_to_generate: vec!["common.proto".into()],
+            proto_file: vec![file],
+            ..Default::default()
+        };
+        let response = generate(&request).expect("encodable_impls=all_messages is recognized");
+        let companion = response
+            .file
+            .iter()
+            .find(|f| f.name.as_deref() == Some("common.__connect.rs"))
+            .expect("plugin should emit impls for a service-less proto");
+        assert!(
+            companion
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("impl ::connectrpc::Encodable<"),
+        );
+    }
+
+    #[test]
+    fn plugin_rejects_invalid_encodable_impls_value() {
+        let request = CodeGeneratorRequest {
+            parameter: Some("buffa_module=crate::proto,encodable_impls=bogus".into()),
+            file_to_generate: vec![],
+            proto_file: vec![],
+            ..Default::default()
+        };
+        let err = generate(&request).expect_err("bogus encodable_impls value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid encodable_impls value"),
+            "error should describe the bad value: {msg}"
+        );
+    }
+
+    #[test]
+    fn generate_files_all_messages_wires_serviceless_companion() {
+        // Unified path: the message-only proto's companion must be wired
+        // into its package stitcher like any service companion.
+        let file = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common.v1".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Shared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let options = Options {
+            encodable_impls: EncodableImpls::AllMessages,
+            ..Options::default()
+        };
+        let generated = generate_files(
+            std::slice::from_ref(&file),
+            &["common.proto".into()],
+            &options,
+        )
+        .unwrap();
+        let companion = generated
+            .iter()
+            .find(|f| f.kind == GeneratedFileKind::Companion)
+            .expect("companion for service-less proto in unified mode");
+        assert_eq!(
+            companion
+                .content
+                .matches("impl ::connectrpc::Encodable<")
+                .count(),
+            2
+        );
+        let stitcher = generated
+            .iter()
+            .find(|f| f.kind == GeneratedFileKind::PackageMod && f.package == "common.v1")
+            .expect("package stitcher");
+        assert!(
+            stitcher
+                .content
+                .contains(&format!("include!(\"{}\")", companion.name)),
+            "stitcher must include the companion: {}",
+            stitcher.content
+        );
+    }
+
+    #[test]
     fn plugin_rejects_old_client_feature_value_form() {
         // The previous design used `client_feature=<name>` with an
         // arbitrary feature name. That option was renamed to the bare
-        // flag `gate_client_feature` (the feature name is fixed as
-        // `client`). A stale buf.gen.yaml using the old form must fail
+        // flag `gate_client_feature`, and custom names now use
+        // `gate_client_feature=<name>`. A stale buf.gen.yaml using the old form must fail
         // loudly, not silently no-op.
         let request = CodeGeneratorRequest {
             parameter: Some("buffa_module=crate::proto,client_feature=client".into()),

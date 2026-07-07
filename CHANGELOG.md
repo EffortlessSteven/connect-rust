@@ -8,6 +8,329 @@ with the [Rust 0.x convention](https://doc.rust-lang.org/cargo/reference/semver.
 breaking changes increment the minor version (0.2 → 0.3), additive changes
 increment the patch version.
 
+Entries for unreleased changes live as fragment files under
+[`.changes/unreleased/`](.changes/unreleased/); run `task changelog-new` to add
+one. This file is assembled from `.changes/` at release time — do not edit it
+directly.
+
+## [0.8.1] - 2026-07-02
+
+### Fixed
+
+- Client stream `message()` futures are `Send` again with concrete generated view types ([#214]). 0.8.0's bound shape on `ServerStream::message`/`BidiStream::message` (projecting `RespView::Owned` in the where-clause) tripped rustc's coroutine-witness auto-trait check on monomorphization, so a server-stream could not be consumed inside `tokio::spawn`; the bound is reshaped as an output type parameter (`RespView: MessageView<'static, Owned = M>`), which is equivalent for every caller and restores `Send`. Call sites are unaffected — `M` is inferred.
+  
+  [#214]: https://github.com/connectrpc/connect-rust/issues/214
+
+## [0.8.0] - 2026-07-01
+
+### Added
+
+- **`encodable_impls=all_messages` codegen option** ([#145], [#205]).
+  `protoc-gen-connect-rust` can now emit the `::connectrpc::Encodable` view
+  impl pair for every message defined in the targeted protos (not only RPC
+  output types), including companion files for protos that declare no
+  services. This is the building block for multi-crate generated-code
+  layouts: Rust's orphan rules require the impls to live in the crate that
+  owns the message types, so generating a shared proto crate with this
+  option lets other crates' handlers return views of those types directly
+  instead of falling back to owned messages or `PreEncoded::from_view`.
+  `connectrpc-build` exposes the same through
+  `Config::encodable_impls(EncodableImpls::AllMessages)`.
+- **Configurable codegen client feature gate name** ([#181], [#194]).
+  `gate_client_feature=<name>` lets `protoc-gen-connect-rust` emit generated
+  client items behind `#[cfg(feature = "<name>")]` instead of the default
+  `client`; `connectrpc-build` exposes the same through
+  `Config::client_feature_name`. The existing bare `gate_client_feature`
+  option and `Config::gate_client_feature(true)` behavior continue to use
+  `client`.
+- **`Http2ConnectionBuilder` with establishment-timeout and HTTP/2 keep-alive
+  knobs** ([#137], [#197]). `Http2Connection::builder()` is now the single
+  configuration surface for every transport flavour (plaintext, TLS,
+  caller-supplied connector, Unix socket); the existing `Http2Connection`
+  constructors are shortcuts for it with default settings. The builder adds
+  `establishment_timeout` (a wall-clock bound on DNS + TCP + TLS + HTTP/2
+  preface as one budget) and `tcp_connect_timeout` (a per-address TCP bound on
+  the built-in connector), and proxies hyper's `keep_alive_interval`,
+  `keep_alive_timeout`, `keep_alive_while_idle`, `initial_stream_window_size`,
+  `initial_connection_window_size`, and `adaptive_window` setters directly,
+  with a `TokioTimer` pre-wired so the keep-alive setters work without hyper's
+  "supply a timer" panic. `h2_settings(|b| ...)` is the escape hatch for hyper
+  knobs not proxied. `HttpClientBuilder` gains the matching
+  `establishment_timeout` (covering DNS + TCP + TLS) and `tcp_connect_timeout`
+  (the canonical name for [#117]'s `connect_timeout`, which remains as an
+  alias). Both builders also expose `no_establishment_timeout` /
+  `no_tcp_connect_timeout` to opt out of the new defaults below.
+- **Optional `json` cargo feature for proto-only builds** ([#172]). The
+  Connect JSON codec requires `serde::Serialize`/`Deserialize` on every
+  message type, so the code generator derives them by default — pure cost for
+  crates that only speak binary proto. The new default-on `json` feature, when
+  disabled (`connectrpc = { default-features = false }`), relaxes the runtime's
+  message-type bounds to just `buffa::Message` via the new
+  `JsonSerialize`/`JsonDeserialize` marker traits, so message types
+  generated with the codegen `no_json` option (no serde derives) compile
+  against the runtime. A proto-only server declines JSON at content
+  negotiation — `application/json` / `application/connect+json` (and the
+  Connect GET `encoding=json` parameter) return HTTP 415, and
+  `application/grpc+json` / `application/grpc-web+json` return a gRPC error
+  status — with message-level encode/decode returning `Unimplemented` as a
+  backstop; the client's `ClientConfig::json` selector is removed from the API
+  in that build. The Connect error/end-stream wire format
+  is always JSON per spec, so `serde`/`serde_json` remain required
+  dependencies. See the
+  [proto-only build guide](docs/guide.md#proto-only-no-json-builds).
+- **Top-down service registration on `Router`** ([#164]). `Router::add_service`
+  registers a generated service from the router outward
+  (`Router::new().add_service(Arc::new(svc))`), the discoverable counterpart to
+  the existing `FooServiceExt::register` extension method, which remains
+  available. New `Router::merge` / `Router::merge_in_place` combine routers, and
+  a new public `ServiceRegister` trait (implemented by codegen) backs
+  `add_service`. Registering or merging a method path that already exists now
+  fails by default so an accidental collision — such as adding the same service
+  twice — surfaces loudly instead of silently shadowing a route: `add_service`,
+  `register`, `merge`, `merge_in_place`, and `merge_routers` panic. Call
+  `Router::allow_overrides` to opt into last-wins replacement across all of
+  them. For assembling routers from dynamic input, `Router::try_merge` /
+  `Router::try_merge_in_place` return a `RouterMergeError` listing the
+  conflicting paths instead of panicking.
+- **Maximum connection age for the built-in server** ([#151]).
+  `with_max_connection_age` (on both `Server` and `BoundServer`) retires
+  long-lived HTTP/2 connections by sending a GOAWAY once a connection reaches
+  the configured age, then force-closing after a grace period
+  (`with_max_connection_age_grace`, default 5s); HTTP/1.1 connections have
+  keep-alive disabled instead. A symmetric ±10% jitter is applied per
+  connection to avoid reconnect bursts. Disabled by default; whole-server
+  graceful shutdown still drains in-flight requests indefinitely.
+- **HTTP/2 adaptive flow-control window, on by default** ([#178]). The built-in
+  server now enables hyper's adaptive (BDP-based) flow-control window sizing by
+  default, so HTTP/2 stream and connection windows grow with the measured
+  bandwidth-delay product instead of staying pinned at hyper's fixed 64 KiB.
+  This is a behaviour change: throughput improves on high-latency,
+  high-bandwidth links (cross-region, high-throughput streaming), at the cost
+  of slightly higher per-connection memory under load. It matches grpc-go and
+  grpc-java, which both autotune by default. New setters on `Server` and
+  `BoundServer` give explicit control: `with_http2_adaptive_window(bool)`
+  toggles autotuning, and `with_http2_initial_stream_window_size` /
+  `with_http2_initial_connection_window_size` set fixed windows (supplying a
+  fixed window turns adaptive sizing off, mirroring grpc-go). The new default
+  is exposed as the `DEFAULT_HTTP2_ADAPTIVE_WINDOW` constant.
+
+- **Connection-level HTTP/1.1 header read timeout** ([#135]). The built-in
+  `Server`/`BoundServer` and the axum `serve_tls` path now install a
+  `TokioTimer` on every accepted connection and apply a header read timeout,
+  configurable via `with_header_read_timeout(Option<Duration>)` (default
+  `DEFAULT_HEADER_READ_TIMEOUT`, 30 seconds; pass `None` to disable). The
+  timeout bounds how long the server waits to read a complete request header
+  block, measured from when hyper begins reading a new request; on a keep-alive
+  connection it also bounds the idle wait between requests. A peer that opens a
+  connection — or finishes one request — and then stalls without sending the
+  next request's headers is now disconnected instead of holding a task and file
+  descriptor open indefinitely, which mitigates slowloris-style
+  connection-exhaustion attacks. Previously no timer was installed, so hyper's
+  built-in header read timeout never took effect; the default is now active.
+  Applies to HTTP/1.1 only — HTTP/2 connection liveness (keep-alive pings) and
+  idle-connection reaping are tracked separately.
+
+### Changed
+
+- **buffa 0.8 adoption** ([#209]). The `buffa` runtime crate's floor
+  moves from 0.7 to 0.8.1 (`buffa-types`, `buffa-codegen`, and
+  `buffa-descriptor` move to 0.8 — the extra 0.8.1 patch is a
+  runtime-only accounting fix, so 0.8.0-generated code qualifies).
+  `ServiceRequest::to_owned_message`,
+  `StreamMessage::to_owned_message`, and the client response's
+  `into_owned` keep their infallible signatures: buffa 0.8 made owned
+  conversion fallible (re-materializing preserved unknown fields could
+  exceed the unknown-field allowance for a view that decoded fine), but
+  buffa 0.8.1 charges every unknown-field record against the decode-time
+  allowance, so a payload that would overflow is rejected at the decode
+  boundary (`invalid_argument`, like any other malformed request) and a
+  successfully decoded view always converts. Two further 0.8 changes are
+  absorbed without API impact: generated map fields are now
+  `buffa::Map<K, V>` instead of `std::collections::HashMap` (hand-written
+  code constructing owned map fields needs the type swap), and the
+  `fast-utf8` decode path that buffa 0.8 ships as a default feature is
+  explicitly enabled, since `connectrpc` builds buffa with
+  `default-features = false`. All checked-in generated code is
+  regenerated against buffa 0.8.1.
+- **Client stream items are now `StreamMessage`** ([#209]).
+  `ServerStream::message()` and `BidiStream::message()` yield
+  `StreamMessage<Resp>` — the same wrapper server handlers receive for
+  inbound streams — instead of a raw `buffa::OwnedView`. Field access
+  moves from `msg.reborrow().field` to `msg.view().field` (or the
+  generated accessor methods), and owned conversion is the same
+  infallible `.to_owned_message()` as everywhere else on the API, so no
+  client-side conversion can fail. `UnaryResponse::into_owned_parts()`
+  is added for the headers-plus-owned-message-plus-trailers case that
+  previously required `into_parts()` followed by a manual conversion.
+  Further migration notes for code that used the item as an `OwnedView`:
+  items no longer implement `PartialEq` or serde `Serialize` (compare or
+  serialize through `msg.view()` / `msg.to_owned_message()`), the
+  consuming `into_bytes()` spelling becomes `msg.bytes().clone()` (same
+  cost — a `Bytes` refcount bump), and hand-written generic wrappers
+  over the stream handles need the new
+  `RespView::Owned: HasMessageView<View<'static> = RespView>` bound at
+  their `.message()` call sites (buffa-generated types always satisfy
+  it).
+- **Crate-root name cleanup and ergonomics fixes** from a pre-release
+  API review ([#209]):
+  - `connectrpc::UnaryResponse` at the crate root is now the client
+    response type (what generated client methods return), alongside new
+    root exports `ServerStream` and `BidiStream`. The wire-level
+    interceptor aliases previously holding those root names —
+    `UnaryRequest`, `UnaryResponse`, `StreamRequest`, `StreamResponse` —
+    are module-scoped only: import them from
+    `connectrpc::interceptor::*`.
+  - `ErrorDetail` is exported at the crate root, and
+    `ErrorDetail::from_message` builds a detail from a protobuf message,
+    handling the protocol's base64 encoding. A hand-populated
+    `ErrorDetail::value` that is not valid base64 now logs a `tracing`
+    warning when it is omitted from a gRPC status instead of vanishing
+    silently.
+  - `connectrpc` re-exports `http_body`, and generated client bounds
+    reference it through the re-export — consumers of generated code no
+    longer need a direct `http-body` dependency.
+  - `StreamMessage::from_message` and the un-hidden
+    `ServiceRequest::from_parts` are the supported way to construct
+    handler inputs in unit tests; the guide gains a "Testing handlers"
+    section.
+  - `InboundStream<M>` (= `ServiceStream<StreamMessage<M>>`) names the
+    inbound stream type in generated client-streaming/bidi handler
+    signatures.
+- **Client transport errors keep their original classification** ([#199]).
+  The client call paths previously wrapped every transport `send` failure as
+  `unavailable` with a `request failed:` prefix, including errors that were
+  already classified `ConnectError`s — so a local configuration mistake such
+  as pointing `HttpClient::plaintext()` at an `https://` URL looked like a
+  retryable outage. A `ConnectError` found anywhere in the transport error's
+  source chain is now surfaced verbatim (code, message, details, and attached
+  metadata; the `request failed:` prefix is gone for the built-in
+  transports). Transport errors with no `ConnectError` in their chain are
+  wrapped as `unavailable`, unchanged. Retry classifiers keyed on
+  `unavailable` keep matching genuine transport outages, and now correctly
+  stop retrying non-retryable local errors; anything matching on the
+  `request failed:` message prefix should match on the error code instead.
+- **Client connection establishment is bounded by default** ([#137], [#197]).
+  `Http2Connection` and `HttpClient` now bound connection establishment to
+  `DEFAULT_ESTABLISHMENT_TIMEOUT` (20s, matching grpc-go's `MinConnectTimeout`)
+  with an additional `DEFAULT_TCP_CONNECT_TIMEOUT` (5s) per-address TCP bound
+  on the built-in connector. Previously, a server that accepted the TCP
+  connection but stalled the TLS handshake — for example a draining pod whose
+  kernel backlog still accepts — would stall `poll_ready` indefinitely for
+  every caller sharing the connection. Exceeding either bound surfaces as
+  `ErrorCode::Unavailable`. **This applies to every existing constructor**
+  (they now delegate through the new builders), so this supersedes the [#117]
+  changelog entry's "behaviour is unchanged for callers who don't opt in"
+  statement under 0.7.0. To restore the unbounded pre-0.8.0 behaviour, call
+  `.no_establishment_timeout().no_tcp_connect_timeout()` on the builder. Note
+  that hyper divides the per-address TCP budget across the resolved address
+  set, so a hostname resolving to many addresses on a high-latency link may
+  need a larger `tcp_connect_timeout` than the 5s default.
+- **Connect streaming EOF without END_STREAM now returns `internal`**
+  ([#168]). The `ServerStream` Connect EOF path that 0.7.0's [#140]
+  introduced as `unavailable` now returns `internal` — the code
+  connect-go reports for this path, and the primary expected code in the
+  upstream conformance suite addition ([connectrpc/conformance#1104]).
+  The HTTP body completes cleanly in this case; it is the Connect
+  envelope sequence that is missing its terminus, so connect-go and other
+  gRPC stacks classify it as a wire-level error in the same family as a
+  failed decompression or an unparseable response, rather than the
+  transport flakiness [#140]'s entry described. **Clients on 0.7.0 that
+  match `Unavailable` for a truncated Connect stream must match `Internal`
+  after this release**, and generic retry middleware that retries on
+  `unavailable` will now treat this case as terminal — a server that omits
+  END_STREAM is not expected to start sending it on retry. The
+  client-streaming check from [#163] ships with the same `internal` code.
+  (The 0.7.0 [#140] entry's "matching connect-go" parenthetical was also
+  inaccurate as to the code, but correct that connect-go is the reference:
+  it returns `internal` for this path.)
+- **Connect Unary-Get query parameters are emitted in the spec-recommended
+  order** ([#167]): `connect`, `base64`, `compression`, `encoding`, `message`.
+  Servers must accept any order, so this is not a wire-compatibility change;
+  the recommended order keeps the variable-length `message` last so the URL
+  prefix is stable for shared caches. Aligns with the order check added to
+  the upstream conformance suite.
+- **Unsupported gRPC/gRPC-Web message codecs return `unimplemented`**
+  ([#180]). A request with a valid `application/grpc` / `application/grpc-web`
+  prefix but a codec the server does not speak (for example
+  `application/grpc+thrift`, or `application/grpc+json` in a proto-only build)
+  now returns grpc-status `unimplemented` (12) instead of `internal` (13).
+  This matches the compression axis, which already returns `unimplemented` for
+  an unsupported `grpc-encoding`. Clients that branch on grpc-status will
+  observe 13 → 12 for this case on upgrade.
+
+- **The built-in server now closes idle/stalled HTTP/1.1 connections by
+  default** ([#135]). Because a connection timer is now installed (see the
+  Added entry above), the 30-second header read timeout is active by default
+  where previously no timer was installed and it never fired. An HTTP/1.1
+  keep-alive connection that sits idle for more than 30 seconds between
+  requests — or that opens and never finishes sending request headers — is now
+  closed. Connect/gRPC traffic is predominantly HTTP/2 and is unaffected, but
+  an HTTP/1.1 client that pools a connection across long idle gaps must
+  reconnect. Raise the duration with `with_header_read_timeout(Some(d))` or
+  disable it with `with_header_read_timeout(None)`.
+
+### Deprecated
+
+- `Http2Connection::with_builder_plaintext` / `with_builder_tls` ([#197]). Use
+  `Http2Connection::builder()` and configure via the proxied keep-alive /
+  window-size setters or `h2_settings(|b| ...)`. The old names collide with the
+  new `builder()` entry point, where "builder" now means
+  `Http2ConnectionBuilder` rather than hyper's HTTP/2 builder.
+
+
+
+### Fixed
+
+- **gRPC unary response content-type validation is protocol- and
+  codec-aware** ([#200]). The client previously accepted any response
+  `content-type` starting with `application/grpc`, so a gRPC client could
+  accept gRPC-Web framing, and a proto-configured client could try to decode
+  JSON bytes as proto. Validation now mirrors connect-go's
+  `grpcValidateResponseContentType`: the exact configured subtype and the
+  bare family type (`application/grpc` / `application/grpc-web`, which imply
+  proto and are what proxies such as Envoy send on trailers-only error
+  replies) are accepted, with `; parameter` suffixes stripped; a same-family
+  codec mismatch is rejected as `internal` and anything else as `unknown`,
+  with the expected content type named in the error message. A missing
+  `content-type` header remains accepted. This also covers gRPC / gRPC-Web
+  client-streaming responses, which share the unary parse path.
+- **Malformed Connect END_STREAM JSON now returns `internal`** ([#192],
+  [#201]). A streaming Connect response whose END_STREAM envelope body was not
+  valid JSON was silently treated as a clean `Ok(None)` close (the parse error
+  fell through `unwrap_or_default()`). It now returns `Err(internal)` with the
+  serde error in the message, matching connect-go's behaviour for the same
+  case, and the error carries the response headers on both the
+  server-streaming and client-streaming paths. Well-formed END_STREAM payloads
+  (including the `null-error`, `missing-code`, and unknown-field conformance
+  shapes) are unchanged.
+- **Connect client-streaming responses require the END_STREAM envelope**
+  ([#163]). A response that ended after its single data message but before
+  the END_STREAM envelope was accepted as a success with empty trailers, so
+  a truncated response was indistinguishable from a complete one. It now
+  returns `Err(internal)` (see [#168]); complete responses are unchanged.
+
+[#135]: https://github.com/connectrpc/connect-rust/issues/135
+[#137]: https://github.com/connectrpc/connect-rust/issues/137
+[#145]: https://github.com/connectrpc/connect-rust/issues/145
+[#205]: https://github.com/connectrpc/connect-rust/pull/205
+[#151]: https://github.com/connectrpc/connect-rust/issues/151
+[#163]: https://github.com/connectrpc/connect-rust/pull/163
+[#164]: https://github.com/connectrpc/connect-rust/pull/164
+[#167]: https://github.com/connectrpc/connect-rust/pull/167
+[#168]: https://github.com/connectrpc/connect-rust/pull/168
+[#172]: https://github.com/connectrpc/connect-rust/pull/172
+[#178]: https://github.com/connectrpc/connect-rust/issues/178
+[#180]: https://github.com/connectrpc/connect-rust/issues/180
+[#181]: https://github.com/connectrpc/connect-rust/issues/181
+[#192]: https://github.com/connectrpc/connect-rust/pull/192
+[#194]: https://github.com/connectrpc/connect-rust/pull/194
+[#197]: https://github.com/connectrpc/connect-rust/pull/197
+[#199]: https://github.com/connectrpc/connect-rust/pull/199
+[#200]: https://github.com/connectrpc/connect-rust/pull/200
+[#201]: https://github.com/connectrpc/connect-rust/pull/201
+[#209]: https://github.com/connectrpc/connect-rust/issues/209
+[connectrpc/conformance#1104]: https://github.com/connectrpc/conformance/pull/1104
+
 ## [0.7.0] - 2026-06-10
 
 A breaking release that reworks both ends of the message surface:
@@ -222,18 +545,18 @@ regenerate with this release's toolchain and buffa ≥ 0.7.0.**
   intended behavior change beyond [#159]; the streaming contract tests'
   assertions are unchanged.
 
-[#127]: https://github.com/anthropics/connect-rust/pull/127
-[#128]: https://github.com/anthropics/connect-rust/pull/128
-[#136]: https://github.com/anthropics/connect-rust/issues/136
-[#139]: https://github.com/anthropics/connect-rust/issues/139
-[#140]: https://github.com/anthropics/connect-rust/issues/140
-[#141]: https://github.com/anthropics/connect-rust/pull/141
-[#143]: https://github.com/anthropics/connect-rust/pull/143
-[#147]: https://github.com/anthropics/connect-rust/pull/147
-[#150]: https://github.com/anthropics/connect-rust/pull/150
-[#157]: https://github.com/anthropics/connect-rust/pull/157
-[#159]: https://github.com/anthropics/connect-rust/pull/159
-[#160]: https://github.com/anthropics/connect-rust/pull/160
+[#127]: https://github.com/connectrpc/connect-rust/pull/127
+[#128]: https://github.com/connectrpc/connect-rust/pull/128
+[#136]: https://github.com/connectrpc/connect-rust/issues/136
+[#139]: https://github.com/connectrpc/connect-rust/issues/139
+[#140]: https://github.com/connectrpc/connect-rust/issues/140
+[#141]: https://github.com/connectrpc/connect-rust/pull/141
+[#143]: https://github.com/connectrpc/connect-rust/pull/143
+[#147]: https://github.com/connectrpc/connect-rust/pull/147
+[#150]: https://github.com/connectrpc/connect-rust/pull/150
+[#157]: https://github.com/connectrpc/connect-rust/pull/157
+[#159]: https://github.com/connectrpc/connect-rust/pull/159
+[#160]: https://github.com/connectrpc/connect-rust/pull/160
 
 ## [0.6.1] - 2026-05-27
 
@@ -269,10 +592,10 @@ now 1.6.
 
 - The minimum supported `bytes` version is now 1.6 ([#132]).
 
-[#130]: https://github.com/anthropics/connect-rust/pull/130
-[#131]: https://github.com/anthropics/connect-rust/pull/131
-[#132]: https://github.com/anthropics/connect-rust/pull/132
-[#133]: https://github.com/anthropics/connect-rust/pull/133
+[#130]: https://github.com/connectrpc/connect-rust/pull/130
+[#131]: https://github.com/connectrpc/connect-rust/pull/131
+[#132]: https://github.com/connectrpc/connect-rust/pull/132
+[#133]: https://github.com/connectrpc/connect-rust/pull/133
 
 ## [0.6.0] - 2026-05-20
 
@@ -397,7 +720,8 @@ rebuilds `OUT_DIR` automatically.
   call so a silently dropped SYN fails in milliseconds instead of the
   kernel's `tcp_syn_retries` default (~130s). The existing constructors
   delegate to the builder with no timeout, so behaviour is unchanged for
-  current callers. `connect_timeout` covers TCP connect only, not DNS
+  current callers. (**Note:** [#197] in 0.8.0 changes this — the constructors
+  are now bounded by default.) `connect_timeout` covers TCP connect only, not DNS
   resolution or the TLS handshake — use `CallOptions::with_timeout` for
   an end-to-end bound.
 
@@ -407,19 +731,19 @@ rebuilds `OUT_DIR` automatically.
   register interceptors without dropping down to
   `Server::from_service(ConnectRpcService::new(...).with_interceptor(...))`.
 
-[#87]: https://github.com/anthropics/connect-rust/issues/87
-[#105]: https://github.com/anthropics/connect-rust/pull/105
-[#110]: https://github.com/anthropics/connect-rust/issues/110
-[#112]: https://github.com/anthropics/connect-rust/pull/112
-[#113]: https://github.com/anthropics/connect-rust/pull/113
-[#114]: https://github.com/anthropics/connect-rust/pull/114
-[#116]: https://github.com/anthropics/connect-rust/pull/116
-[#117]: https://github.com/anthropics/connect-rust/pull/117
-[#118]: https://github.com/anthropics/connect-rust/pull/118
-[#119]: https://github.com/anthropics/connect-rust/pull/119
-[#120]: https://github.com/anthropics/connect-rust/pull/120
-[#121]: https://github.com/anthropics/connect-rust/pull/121
-[#123]: https://github.com/anthropics/connect-rust/pull/123
+[#87]: https://github.com/connectrpc/connect-rust/issues/87
+[#105]: https://github.com/connectrpc/connect-rust/pull/105
+[#110]: https://github.com/connectrpc/connect-rust/issues/110
+[#112]: https://github.com/connectrpc/connect-rust/pull/112
+[#113]: https://github.com/connectrpc/connect-rust/pull/113
+[#114]: https://github.com/connectrpc/connect-rust/pull/114
+[#116]: https://github.com/connectrpc/connect-rust/pull/116
+[#117]: https://github.com/connectrpc/connect-rust/pull/117
+[#118]: https://github.com/connectrpc/connect-rust/pull/118
+[#119]: https://github.com/connectrpc/connect-rust/pull/119
+[#120]: https://github.com/connectrpc/connect-rust/pull/120
+[#121]: https://github.com/connectrpc/connect-rust/pull/121
+[#123]: https://github.com/connectrpc/connect-rust/pull/123
 [`Spec`]: https://docs.rs/connectrpc/latest/connectrpc/spec/struct.Spec.html
 [`Payload`]: https://docs.rs/connectrpc/latest/connectrpc/payload/struct.Payload.html
 [`AnyMessage`]: https://docs.rs/connectrpc/latest/connectrpc/payload/trait.AnyMessage.html
@@ -676,15 +1000,15 @@ mechanical: direct field reads become accessor calls (`ctx.headers` →
   The directives are now suppressed in Buf mode, completing the fix #56
   applied to `Precompiled` mode. Manual `protoc` mode is unchanged.
 
-[#59]: https://github.com/anthropics/connect-rust/pull/59
-[#98]: https://github.com/anthropics/connect-rust/pull/98
-[#100]: https://github.com/anthropics/connect-rust/pull/100
-[#101]: https://github.com/anthropics/connect-rust/pull/101
-[#103]: https://github.com/anthropics/connect-rust/pull/103
-[#105]: https://github.com/anthropics/connect-rust/pull/105
-[#108]: https://github.com/anthropics/connect-rust/pull/108
-[#109]: https://github.com/anthropics/connect-rust/pull/109
-[#111]: https://github.com/anthropics/connect-rust/pull/111
+[#59]: https://github.com/connectrpc/connect-rust/pull/59
+[#98]: https://github.com/connectrpc/connect-rust/pull/98
+[#100]: https://github.com/connectrpc/connect-rust/pull/100
+[#101]: https://github.com/connectrpc/connect-rust/pull/101
+[#103]: https://github.com/connectrpc/connect-rust/pull/103
+[#105]: https://github.com/connectrpc/connect-rust/pull/105
+[#108]: https://github.com/connectrpc/connect-rust/pull/108
+[#109]: https://github.com/connectrpc/connect-rust/pull/109
+[#111]: https://github.com/connectrpc/connect-rust/pull/111
 [@Yong-yuan-X]: https://github.com/Yong-yuan-X
 [@hobostay]: https://github.com/hobostay
 
@@ -935,13 +1259,13 @@ rebuilds `OUT_DIR` automatically.
   `build.rs` context (e.g. from a Bazel genrule or standalone host tool).
   Default remains `true`.
 
-[#80]: https://github.com/anthropics/connect-rust/pull/80
-[#7]: https://github.com/anthropics/connect-rust/issues/7
-[#34]: https://github.com/anthropics/connect-rust/issues/34
-[#50]: https://github.com/anthropics/connect-rust/issues/50
-[#55]: https://github.com/anthropics/connect-rust/pull/55
-[#61]: https://github.com/anthropics/connect-rust/issues/61
-[#63]: https://github.com/anthropics/connect-rust/pull/63
+[#80]: https://github.com/connectrpc/connect-rust/pull/80
+[#7]: https://github.com/connectrpc/connect-rust/issues/7
+[#34]: https://github.com/connectrpc/connect-rust/issues/34
+[#50]: https://github.com/connectrpc/connect-rust/issues/50
+[#55]: https://github.com/connectrpc/connect-rust/pull/55
+[#61]: https://github.com/connectrpc/connect-rust/issues/61
+[#63]: https://github.com/connectrpc/connect-rust/pull/63
 [buffa#22]: https://github.com/anthropics/buffa/pull/22
 [buffa#55]: https://github.com/anthropics/buffa/pull/55
 [buffa#62]: https://github.com/anthropics/buffa/pull/62
@@ -974,10 +1298,10 @@ rebuilds `OUT_DIR` automatically.
 - New `examples/streaming-tour` and `examples/middleware` crates,
   plus a user guide under `docs/guide.md` ([#46], [#48]).
 
-[#44]: https://github.com/anthropics/connect-rust/pull/44
-[#46]: https://github.com/anthropics/connect-rust/pull/46
-[#48]: https://github.com/anthropics/connect-rust/pull/48
-[#56]: https://github.com/anthropics/connect-rust/pull/56
+[#44]: https://github.com/connectrpc/connect-rust/pull/44
+[#46]: https://github.com/connectrpc/connect-rust/pull/46
+[#48]: https://github.com/connectrpc/connect-rust/pull/48
+[#56]: https://github.com/connectrpc/connect-rust/pull/56
 
 ## [0.3.2] - 2026-04-03
 
@@ -1017,10 +1341,10 @@ rebuilds `OUT_DIR` automatically.
   Currently exercises unary calls without deadlines; timeouts and
   streaming require additional setup beyond the example.
 
-[#16]: https://github.com/anthropics/connect-rust/pull/16
-[#19]: https://github.com/anthropics/connect-rust/pull/19
-[#32]: https://github.com/anthropics/connect-rust/pull/32
-[#37]: https://github.com/anthropics/connect-rust/pull/37
+[#16]: https://github.com/connectrpc/connect-rust/pull/16
+[#19]: https://github.com/connectrpc/connect-rust/pull/19
+[#32]: https://github.com/connectrpc/connect-rust/pull/32
+[#37]: https://github.com/connectrpc/connect-rust/pull/37
 
 ## [0.3.1] - 2026-04-02
 
@@ -1035,7 +1359,7 @@ rebuilds `OUT_DIR` automatically.
   `no_register_fn` parameter for path-compat with the unified `connectrpc-build`
   flow.
 
-[#35]: https://github.com/anthropics/connect-rust/pull/35
+[#35]: https://github.com/connectrpc/connect-rust/pull/35
 
 ## [0.3.0] - 2026-04-02
 
@@ -1088,14 +1412,14 @@ rebuilds `OUT_DIR` automatically.
   trait is suffixed to `Self_`; the `SelfExt` / `SelfClient` / `SelfServer`
   derivatives are unaffected since the suffix already de-keywords them.
 
-[#15]: https://github.com/anthropics/connect-rust/pull/15
-[#22]: https://github.com/anthropics/connect-rust/pull/22
-[#23]: https://github.com/anthropics/connect-rust/issues/23
-[#24]: https://github.com/anthropics/connect-rust/pull/24
-[#26]: https://github.com/anthropics/connect-rust/pull/26
-[#27]: https://github.com/anthropics/connect-rust/pull/27
-[#28]: https://github.com/anthropics/connect-rust/pull/28
-[#31]: https://github.com/anthropics/connect-rust/pull/31
+[#15]: https://github.com/connectrpc/connect-rust/pull/15
+[#22]: https://github.com/connectrpc/connect-rust/pull/22
+[#23]: https://github.com/connectrpc/connect-rust/issues/23
+[#24]: https://github.com/connectrpc/connect-rust/pull/24
+[#26]: https://github.com/connectrpc/connect-rust/pull/26
+[#27]: https://github.com/connectrpc/connect-rust/pull/27
+[#28]: https://github.com/connectrpc/connect-rust/pull/28
+[#31]: https://github.com/connectrpc/connect-rust/pull/31
 
 ## [0.2.1] - 2026-03-18
 
@@ -1118,14 +1442,14 @@ rebuilds `OUT_DIR` automatically.
   `readme = "../README.md"`, so the crates.io page for 0.2.0 shows the
   stale version; this release updates it.
 
-[#1]: https://github.com/anthropics/connect-rust/issues/1
-[#2]: https://github.com/anthropics/connect-rust/issues/2
-[#3]: https://github.com/anthropics/connect-rust/pull/3
-[#4]: https://github.com/anthropics/connect-rust/pull/4
+[#1]: https://github.com/connectrpc/connect-rust/issues/1
+[#2]: https://github.com/connectrpc/connect-rust/issues/2
+[#3]: https://github.com/connectrpc/connect-rust/pull/3
+[#4]: https://github.com/connectrpc/connect-rust/pull/4
 
 ## [0.2.0] - 2026-03-17
 
-First release from the [anthropics/connect-rust](https://github.com/anthropics/connect-rust)
+First release from the [anthropics/connect-rust](https://github.com/connectrpc/connect-rust)
 repository. This is a complete from-scratch implementation — not a continuation
 of the 0.1.x releases previously published under the `connectrpc` crate name,
 which have been superseded.

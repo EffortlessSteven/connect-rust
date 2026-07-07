@@ -2,9 +2,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/connectrpc.svg)](https://crates.io/crates/connectrpc)
 [![docs.rs](https://img.shields.io/docsrs/connectrpc)](https://docs.rs/connectrpc)
-[![CI](https://github.com/anthropics/connect-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/anthropics/connect-rust/actions/workflows/ci.yml)
+[![CI](https://github.com/connectrpc/connect-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/connectrpc/connect-rust/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/crates/msrv/connectrpc)](Cargo.toml)
-[![deps.rs](https://deps.rs/repo/github/anthropics/connect-rust/status.svg)](https://deps.rs/repo/github/anthropics/connect-rust)
+[![deps.rs](https://deps.rs/repo/github/connectrpc/connect-rust/status.svg)](https://deps.rs/repo/github/connectrpc/connect-rust)
 [![License](https://img.shields.io/crates/l/connectrpc)](LICENSE)
 
 A [Tower](https://docs.rs/tower/latest/tower/)-based Rust implementation of [ConnectRPC](https://connectrpc.com/), serving Connect, gRPC, and gRPC-Web clients over HTTP with binary or JSON protobuf messages.
@@ -80,9 +80,9 @@ ship Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows
 (`.sig` + `.pem`), and a GitHub-native build provenance attestation.
 
 ```sh
-VERSION=v0.7.0
+VERSION=v0.8.0
 PLATFORM=linux-x86_64        # or darwin-aarch64, etc.
-BASE=https://github.com/anthropics/connect-rust/releases/download/${VERSION}
+BASE=https://github.com/connectrpc/connect-rust/releases/download/${VERSION}
 BIN=protoc-gen-connect-rust-${VERSION}-${PLATFORM}
 
 curl -fSL -o "${BIN}"        "${BASE}/${BIN}"
@@ -94,13 +94,13 @@ curl -fSL -o checksums-sha256.txt "${BASE}/checksums-sha256.txt"
 grep " ${BIN}\$" checksums-sha256.txt | sha256sum -c -
 
 # Verify the GitHub-native attestation (no .sig/.pem download needed).
-gh attestation verify "${BIN}" --repo anthropics/connect-rust
+gh attestation verify "${BIN}" --repo connectrpc/connect-rust
 
 # Or verify the cosign signature directly.
 cosign verify-blob \
   --certificate "${BIN}.pem" \
   --signature "${BIN}.sig" \
-  --certificate-identity "https://github.com/anthropics/connect-rust/.github/workflows/release.yml@refs/tags/${VERSION}" \
+  --certificate-identity "https://github.com/connectrpc/connect-rust/.github/workflows/release.yml@refs/tags/${VERSION}" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   "${BIN}"
 
@@ -116,7 +116,7 @@ cargo install --locked connectrpc-codegen
 ```
 
 **3. Buf Schema Registry remote plugin (planned).** Once accepted upstream
-the plugin will be runnable as `remote: buf.build/anthropics/connect-rust`
+the plugin will be runnable as `remote: buf.build/connectrpc/connect-rust`
 in `buf.gen.yaml`, with no local install step.
 
 ```yaml
@@ -157,8 +157,8 @@ Changing the mount point requires regenerating.
 > The underlying option is `extern_path=.=crate::proto` - same format the
 > Buf Schema Registry uses when generating Cargo SDKs. `buffa_module=X`
 > is shorthand for the `.` catch-all case. Any module an `extern_path`
-> points at must be buffa-generated code from buffa 0.7.0 or newer with
-> views enabled (buffa-types 0.7+ for the well-known types): the service
+> points at must be buffa-generated code from buffa 0.8.0 or newer with
+> views enabled (buffa-types 0.8+ for the well-known types): the service
 > stubs rely on the `HasMessageView` impls and owned-view wrappers that
 > buffa generates alongside each message, just as they rely on the JSON
 > serialization impls.
@@ -170,7 +170,7 @@ assembled via a single `include!`. No plugin binaries required at build time.
 
 ```toml
 [build-dependencies]
-connectrpc-build = "0.7"
+connectrpc-build = "0.8"
 ```
 
 ```rust
@@ -224,8 +224,7 @@ use axum::{Router, routing::get};
 use connectrpc::Router as ConnectRouter;
 use std::sync::Arc;
 
-let service = Arc::new(MyGreetService);
-let connect = service.register(ConnectRouter::new());
+let connect = ConnectRouter::new().add_service(Arc::new(MyGreetService));
 
 // Plain HTTP liveness probe for `kubectl`'s httpGet style. For the
 // standard gRPC Health protocol (grpc_health_probe, kubelet `grpc:`
@@ -247,8 +246,7 @@ For simple cases, enable the `server` feature for a built-in hyper server:
 use connectrpc::{Router, Server};
 use std::sync::Arc;
 
-let service = Arc::new(MyGreetService);
-let router = service.register(Router::new());
+let router = Router::new().add_service(Arc::new(MyGreetService));
 
 Server::new(router).serve("127.0.0.1:8080".parse()?).await?;
 ```
@@ -318,6 +316,7 @@ The Quick Start above shows the unary path. For everything else, see the user gu
 
 | Feature      | Default | Description                                      |
 | ------------ | ------- | ------------------------------------------------ |
+| `json`       | Yes     | JSON codec for protobuf messages. Disable (with codegen `no_json`) for proto-only builds — see [Proto-only builds](#proto-only-no-json-builds) |
 | `gzip`       | Yes     | Gzip compression via flate2                      |
 | `zstd`       | Yes     | Zstandard compression via zstd                   |
 | `streaming`  | Yes     | Streaming compression via async-compression      |
@@ -334,21 +333,51 @@ The core crate compiles for `wasm32-unknown-unknown`. Generated clients are gene
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", default-features = false, features = ["gzip"] }
+connectrpc = { version = "0.8", default-features = false, features = ["gzip"] }
 ```
 
 ### Minimal build (no compression)
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", default-features = false }
+connectrpc = { version = "0.8", default-features = false }
 ```
+
+### Proto-only (no-JSON) builds
+
+A deployment that only speaks binary proto can drop the JSON codec and the
+`serde` derives it requires on message types. Generate code with the `no_json`
+plugin option (or `connectrpc-build`'s `.generate_json(false)`) so message
+structs are emitted without serde derives, and disable the runtime `json`
+feature:
+
+```toml
+[dependencies]
+# Note: `default-features = false` is the only way to drop `json`, so it also
+# drops the default compression features — re-list any you still want.
+connectrpc = { version = "0.8", default-features = false, features = ["server", "gzip", "zstd", "streaming"] }
+```
+
+With `json` off, message-type bounds relax from `Message + Serialize` to just
+`Message`, so serde-free generated code compiles. A JSON request to such a
+server is declined at content negotiation with HTTP 415 Unsupported Media Type
+(for gRPC / gRPC-Web, a gRPC error status); the JSON codec selectors on the
+client (`ClientConfig::json`) are removed from the API too. See the [user guide](docs/guide.md#proto-only-no-json-builds) for
+details.
+
+> **Cargo feature unification:** `json` is an additive, default-on feature, so
+> it is only truly off when *every* crate in your dependency graph that pulls in
+> `connectrpc` disables it. If any other crate depends on `connectrpc` with
+> `json` on, unification turns it back on for the whole build and your
+> serde-free generated types will fail to compile (`Serialize is not
+> satisfied`). Proto-only mode therefore fits leaf binaries and fully
+> proto-only graphs, not a single library in a mixed workspace.
 
 ### With Axum integration
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", features = ["axum"] }
+connectrpc = { version = "0.8", features = ["axum"] }
 ```
 
 ## Generated Code Dependencies
@@ -357,13 +386,20 @@ Code generated by `protoc-gen-connect-rust` requires these dependencies:
 
 ```toml
 [dependencies]
-connectrpc = { version = "0.7", features = ["client"] }
-buffa = { version = "0.7", features = ["json"] }
-buffa-types = { version = "0.7", features = ["json"] }
+connectrpc = { version = "0.8", features = ["client"] }
+buffa = { version = "0.8.1", features = ["json"] }
+buffa-types = { version = "0.8", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-http-body = "1"
 ```
+
+(`http-body`, whose `Body` trait appears in generated client bounds, is
+re-exported by `connectrpc` — no direct dependency needed.)
+
+For **proto-only** code (generated with `no_json`, and `connectrpc` built with
+`default-features = false`), drop the `json` feature on `buffa`/`buffa-types`
+and omit `serde`/`serde_json` — the generated message types no longer derive
+them. See [Proto-only builds](#proto-only-no-json-builds).
 
 ### Optional: gate the client behind a Cargo feature
 
@@ -400,7 +436,7 @@ default = ["client"]
 client = ["connectrpc/client"]
 
 [dependencies]
-connectrpc = { version = "0.7", features = ["server"] }  # no "client"
+connectrpc = { version = "0.8", features = ["server"] }  # no "client"
 ```
 
 `cargo build --no-default-features` now leaves out the `FooClient` items
@@ -611,7 +647,10 @@ Local copies can be fetched with `task specs:fetch` (see [`docs/specs/`](docs/sp
 
 ## Contributing
 
-By submitting a pull request, you agree to the terms of our [Contributor License Agreement](CLA.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be signed off to
+affirm the [Developer Certificate of Origin](https://developercertificate.org/)
+(`git commit -s`); no Contributor License Agreement is required. The current
+maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 ## License
 

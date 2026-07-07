@@ -1,11 +1,24 @@
 # Contributing to connect-rust
 
 See [`docs/guide.md`](docs/guide.md) for the user-facing handler/client API
-and the [README](README.md) for the workspace layout.
+and the [README](README.md) for the workspace layout. The current project
+maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
+
+## Developer Certificate of Origin
+
+All commits must be signed off to affirm compliance with the
+[Developer Certificate of Origin](https://developercertificate.org/).
+No Contributor License Agreement is required. Configure your git identity
+to match your GitHub account, then use the `-s` flag when committing:
+
+```console
+$ git commit -s -m "your commit message"
+```
 
 ## Prerequisites
 
-- **Rust 1.88+** (MSRV; the codebase uses let-chains).
+- **Rust 1.88+** (MSRV; source of truth is `rust-version` in the workspace
+  `Cargo.toml` — the codebase uses let-chains).
 - **`protoc` v27+** — the test and example protos use editions syntax
   (`edition = "2023"`). Ubuntu's apt `protobuf-compiler` (v21) is too old;
   install from the [protobuf releases] page or via `arduino/setup-protoc`
@@ -24,6 +37,37 @@ Keep each change to **≤ 250 lines net** (additions minus deletions,
 excluding test files and `*/generated/*`) wherever possible. If a task
 naturally exceeds that, split it into focused, self-contained PRs or
 commits.
+
+## Changelog
+
+`CHANGELOG.md` is **generated** — do not edit it directly. Each change is
+recorded as a small fragment file under `.changes/unreleased/`, so two PRs
+never touch the same lines and the changelog never causes a merge conflict.
+
+Add a fragment for any user-visible change:
+
+```bash
+task changelog-new          # prompts for kind (Added/Changed/Fixed/…) and a body
+# or, non-interactively:
+task changelog-new -- -k Fixed -b "One-line description of the change."
+```
+
+This writes `.changes/unreleased/<Kind>-<timestamp>.yaml`; commit it with your
+change. Bodies may span multiple lines and use the same Markdown (`` `code` ``,
+`[#NNN]` issue/PR references) as the existing entries. Skip the fragment only
+for changes with no changelog impact (internal refactors, test-only edits, CI
+tweaks).
+
+The `check-changelog` CI job regenerates `CHANGELOG.md` with `changie merge`
+and fails if it differs from what is committed, so a directly-edited or stale
+`CHANGELOG.md` will be caught.
+
+At release time the maintainer rolls the fragments into a version section:
+
+```bash
+task changelog-batch -- 0.8.0   # fragments → .changes/0.8.0.md (edit for prose)
+task changelog-merge            # regenerate CHANGELOG.md
+```
 
 ## Test Coverage
 
@@ -138,7 +182,8 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
 - **Check generated code** — runs `task generate:all` and verifies the
   checked-in generated directories have no diff
 - **Documentation** — `cargo doc` with broken-intra-doc-links denied
-- **MSRV (1.88)** — `cargo check` on the pinned minimum toolchain
+- **MSRV** — `cargo check` on the minimum toolchain, read from `rust-version`
+  in the workspace `Cargo.toml` so the declaration and the check cannot drift
 - **Examples** — builds and runs the example crates
 - **Minimal features** — `cargo check -p connectrpc --no-default-features`
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
