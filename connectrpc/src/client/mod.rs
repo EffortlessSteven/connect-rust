@@ -2251,7 +2251,8 @@ where
     // An absent one is not: a proxy that drops `content-type` from its local
     // reply may still send `grpc-status`, so that reply is parsed and its
     // trailers-only status honoured below.
-    let content_type = validate_grpc_response_content_type(&resp_headers, config);
+    let content_type =
+        validate_grpc_response_content_type(&resp_headers, config.protocol, config.codec_format);
     let speaks_grpc = content_type.is_ok()
         && (resp_headers.contains_key(http::header::CONTENT_TYPE)
             || resp_headers.contains_key("grpc-status"));
@@ -2517,24 +2518,23 @@ where
 }
 
 /// Validate the `content-type` of a gRPC / gRPC-Web response against the
-/// client's configured protocol and codec, mirroring connect-go's
-/// `grpcValidateResponseContentType`.
+/// client's configured protocol and codec.
 ///
-/// Parameters (`; charset=...`) are stripped before comparison. The bare
-/// family types `application/grpc` / `application/grpc-web` are accepted for
-/// any codec, because the bare type means "proto by default" and proxies that
-/// synthesize trailers-only error responses (such as Envoy local replies)
-/// send it regardless of the request's subtype. A missing `content-type`
-/// header is also accepted, preserving this client's previous leniency. A
-/// same-family subtype that doesn't match the configured codec is rejected as
-/// `internal` (a broken server or intermediary); anything else is `unknown`
-/// (not a gRPC response at all), matching connect-go's classification.
+/// The family/error-code classification follows connect-go: same-family codec
+/// mismatches are `internal`, while responses outside the configured gRPC
+/// family are `unknown`. Connect-rust deliberately preserves its existing
+/// compatibility behavior: parameters are ignored, a missing header is
+/// accepted, and the bare `application/grpc` / `application/grpc-web` family
+/// is accepted for every configured codec. In particular, proxies such as
+/// Envoy can synthesize trailers-only replies using the bare family type
+/// regardless of the request subtype.
 fn validate_grpc_response_content_type(
     resp_headers: &http::HeaderMap,
-    config: &ClientConfig,
+    protocol: Protocol,
+    codec_format: CodecFormat,
 ) -> Result<(), ConnectError> {
     debug_assert!(
-        matches!(config.protocol, Protocol::Grpc | Protocol::GrpcWeb),
+        matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb),
         "gRPC response content-type validation is only for gRPC/gRPC-Web"
     );
 
@@ -2547,10 +2547,9 @@ fn validate_grpc_response_content_type(
         .split_once(';')
         .map_or(ct, |(media_type, _params)| media_type)
         .trim();
-    let expected = config
-        .protocol
-        .response_content_type(config.codec_format, false);
-    let (bare, family_prefix) = match config.protocol {
+    // gRPC and gRPC-Web use the same response media type for every RPC shape.
+    let expected = protocol.response_content_type(codec_format, false);
+    let (bare, family_prefix) = match protocol {
         Protocol::Grpc => ("application/grpc", "application/grpc+"),
         Protocol::GrpcWeb => ("application/grpc-web", "application/grpc-web+"),
         // Unreachable per the debug_assert above; treat as valid rather than
@@ -3116,6 +3115,8 @@ where
 /// Returns immediately with an error if:
 /// - The request cannot be encoded or sent
 /// - The server responds with a non-200 status (protocol-level error)
+/// - A successful gRPC or gRPC-Web response declares a content type
+///   incompatible with the configured protocol or codec
 ///
 /// Errors that occur during the stream (e.g., in gRPC trailers or the
 /// END_STREAM envelope) are returned by [`ServerStream::message()`].
@@ -3215,9 +3216,10 @@ where
 /// Construct a [`ServerStream`] from a streaming HTTP response.
 ///
 /// Handles trailers-only gRPC error detection, non-200 Connect error body
-/// parsing, and response encoding extraction. Used by both [`call_server_stream`]
-/// (passing fields from `&ClientConfig`) and [`BidiStream::message`] (passing
-/// fields from its owned `StreamConfig` snapshot).
+/// parsing, successful gRPC-family content-type validation, and response
+/// encoding extraction. Used by both [`call_server_stream`] (passing fields
+/// from `&ClientConfig`) and [`BidiStream::message`] (passing fields from its
+/// owned `StreamConfig` snapshot).
 ///
 /// Takes individual config fields instead of `&ClientConfig` so callers that
 /// need to capture config by value (like `BidiStream`, which outlives the
@@ -3298,6 +3300,13 @@ where
         let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
         err.set_response_headers(response_headers);
         return Err(err);
+    }
+
+    match protocol {
+        Protocol::Grpc | Protocol::GrpcWeb => {
+            validate_grpc_response_content_type(&response_headers, protocol, codec_format)?;
+        }
+        Protocol::Connect => {}
     }
 
     // Get the response encoding for compressed envelopes (protocol-aware header)
@@ -4918,6 +4927,195 @@ fn append_metadata_capped(trailers: &mut http::HeaderMap, metadata: HashMap<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct StaticResponseTransport {
+        headers: http::HeaderMap,
+    }
+
+    impl ClientTransport for StaticResponseTransport {
+        type ResponseBody = Full<Bytes>;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            _request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            let headers = self.headers.clone();
+            Box::pin(async move {
+                let mut response = Response::builder()
+                    .status(http::StatusCode::OK)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                *response.headers_mut() = headers;
+                Ok(response)
+            })
+        }
+    }
+
+    fn streaming_response(content_type: Option<&'static str>) -> Response<Full<Bytes>> {
+        let mut builder = Response::builder()
+            .status(http::StatusCode::OK)
+            .header("x-request-id", "abc123");
+        if let Some(content_type) = content_type {
+            builder = builder.header(http::header::CONTENT_TYPE, content_type);
+        }
+        builder.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_grpc_response_content_type_rejects_mismatches() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let compression = CompressionRegistry::new();
+        let rejected = [
+            (
+                Protocol::Grpc,
+                CodecFormat::Proto,
+                "application/grpc-web+proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::GrpcWeb,
+                CodecFormat::Proto,
+                "application/grpc+proto",
+                ErrorCode::Unknown,
+            ),
+            (
+                Protocol::Grpc,
+                CodecFormat::Json,
+                "application/grpc+proto",
+                ErrorCode::Internal,
+            ),
+            (
+                Protocol::GrpcWeb,
+                CodecFormat::Json,
+                "application/grpc-web+proto",
+                ErrorCode::Internal,
+            ),
+        ];
+
+        for (protocol, codec_format, actual, expected_code) in rejected {
+            let expected = protocol.response_content_type(codec_format, false);
+            let err = make_server_stream::<_, StringValueView<'static>>(
+                streaming_response(Some(actual)),
+                protocol,
+                &compression,
+                codec_format,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("incompatible content type must reject stream construction");
+
+            assert_eq!(err.code, expected_code, "content-type {actual}");
+            assert!(
+                err.message.as_deref().is_some_and(|message| {
+                    message.contains(actual) && message.contains(expected)
+                })
+            );
+            assert_eq!(err.response_headers()["x-request-id"], "abc123");
+            assert_eq!(err.response_headers()[http::header::CONTENT_TYPE], actual);
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_grpc_response_content_type_preserves_compatibility() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let compression = CompressionRegistry::new();
+        let accepted = [
+            (
+                Protocol::Grpc,
+                CodecFormat::Proto,
+                Some("application/grpc+proto"),
+            ),
+            (
+                Protocol::GrpcWeb,
+                CodecFormat::Json,
+                Some("application/grpc-web"),
+            ),
+            (
+                Protocol::Grpc,
+                CodecFormat::Json,
+                Some("application/grpc; charset=utf-8"),
+            ),
+            (Protocol::GrpcWeb, CodecFormat::Proto, None),
+        ];
+
+        for (protocol, codec_format, content_type) in accepted {
+            make_server_stream::<_, StringValueView<'static>>(
+                streaming_response(content_type),
+                protocol,
+                &compression,
+                codec_format,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("established compatibility case must remain accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_content_type_validation_preserves_http_status_precedence() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        let response = Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let err = make_server_stream::<_, StringValueView<'static>>(
+            response,
+            Protocol::Grpc,
+            &CompressionRegistry::new(),
+            CodecFormat::Proto,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("HTTP status must be classified before content type");
+
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(
+            err.message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("HTTP error 502"))
+        );
+    }
+
+    #[tokio::test]
+    async fn call_server_stream_rejects_cross_protocol_trailers_only_response() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc-web+proto"),
+        );
+        headers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let transport = StaticResponseTransport { headers };
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        let err = call_server_stream::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            "test.Service",
+            "ServerStream",
+            StringValue::from("hello"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("wrong-family response must fail before a ServerStream is returned");
+
+        assert_eq!(err.code, ErrorCode::Unknown);
+    }
 
     #[test]
     fn overflow_payload_is_internal_at_response_decode() {
@@ -8066,8 +8264,9 @@ mod tests {
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
 
-        let err = validate_grpc_response_content_type(&headers, &config)
-            .expect_err("non-gRPC content type must be rejected");
+        let err =
+            validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
+                .expect_err("non-gRPC content type must be rejected");
         assert_eq!(err.code, ErrorCode::Unknown);
         assert_eq!(
             err.message.as_deref(),
@@ -8083,8 +8282,12 @@ mod tests {
     fn grpc_response_content_type_accepts_missing_header() {
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
-        validate_grpc_response_content_type(&http::HeaderMap::new(), &config)
-            .expect("missing content-type must remain accepted");
+        validate_grpc_response_content_type(
+            &http::HeaderMap::new(),
+            config.protocol,
+            config.codec_format,
+        )
+        .expect("missing content-type must remain accepted");
     }
 
     #[test]
@@ -8100,7 +8303,7 @@ mod tests {
         let config = ClientConfig::new("http://localhost".parse().unwrap())
             .with_protocol(Protocol::Grpc)
             .with_codec_format(CodecFormat::Json);
-        validate_grpc_response_content_type(&headers, &config)
+        validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
             .expect("bare application/grpc must be accepted for a json-codec client");
     }
 
@@ -8113,7 +8316,7 @@ mod tests {
         );
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
-        validate_grpc_response_content_type(&headers, &config)
+        validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
             .expect("bare application/grpc-web must be accepted as proto");
     }
 
@@ -8127,8 +8330,9 @@ mod tests {
         let config =
             ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::GrpcWeb);
 
-        let err = validate_grpc_response_content_type(&headers, &config)
-            .expect_err("gRPC-Web client must reject plain gRPC content type");
+        let err =
+            validate_grpc_response_content_type(&headers, config.protocol, config.codec_format)
+                .expect_err("gRPC-Web client must reject plain gRPC content type");
         assert_eq!(err.code, ErrorCode::Unknown);
         assert_eq!(
             err.message.as_deref(),
