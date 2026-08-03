@@ -25,6 +25,20 @@ for ::buffa::view::OwnedView<
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
 }
 /// Full service name for this service.
 pub const HEALTH_SERVICE_NAME: &str = "grpc.health.v1.Health";
@@ -74,7 +88,7 @@ pub const HEALTH_WATCH_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.9.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -125,11 +139,13 @@ pub trait Health: Send + Sync + 'static {
     /// The server will immediately send back a message indicating the current
     /// serving status. It will then subsequently send a new message whenever
     /// the service's serving status changes.
+    ///
     /// If the requested service is unknown when the call is received, the
     /// server will send a message setting the serving status to SERVICE_UNKNOWN
     /// but will *not* terminate the call. If at some future point, the serving
     /// status of the service becomes known, the server will send a new message
     /// with the service's serving status.
+    ///
     /// If the call terminates with status UNIMPLEMENTED, then the client should
     /// assume this method is not supported and should not retry the call. If
     /// the call terminates with any other status (including OK), then the
@@ -336,6 +352,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,
@@ -372,6 +389,7 @@ impl<T: Health> ::connectrpc::Dispatcher for HealthServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::grpc::health::v1::HealthCheckRequest,

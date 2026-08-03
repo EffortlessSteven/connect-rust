@@ -44,8 +44,8 @@ complete dependency block for a typical (JSON-capable) service:
 ```toml
 [dependencies]
 connectrpc = "0.8"
-buffa = { version = "0.8.1", features = ["json"] }
-buffa-types = { version = "0.8", features = ["json"] }
+buffa = { version = "0.9", features = ["json"] }
+buffa-types = { version = "0.9", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -333,6 +333,70 @@ pub mod proto;
 The underlying difference (`OUT_DIR` vs a known source path) is honest
 and visible, but the call-site shape is parallel.
 
+### Very large schemas
+
+Generation reads a descriptor set, and buffa bounds how much memory a
+decode may commit to repeated elements. That bound is an amplification
+defence sized for untrusted wire input, and it is charged on each
+element's struct size rather than on its encoded bytes — so descriptor
+sets, whose structs are wide, reach it while still looking small on the
+wire. The tooling paths — this plugin and `connectrpc-build` — therefore
+decode under buffa's much higher tooling bound of 1 GiB. It stays finite,
+so a truncated or corrupt set still fails with an error instead of
+exhausting memory.
+
+If you do exceed it, generation stops with a message naming the budget in
+force and both ways to raise it. Both accept a byte count or `unlimited`,
+and they differ in reach.
+
+**The environment variable covers the whole run**, which is normally what
+you want:
+
+```sh
+BUFFA_ELEMENT_MEMORY_LIMIT=4294967296 buf generate
+BUFFA_ELEMENT_MEMORY_LIMIT=4294967296 cargo build
+```
+
+`buf generate` hands the identical request to every plugin in the run, so
+a schema big enough to need raising needs it for `protoc-gen-buffa` and
+`protoc-gen-connect-rust` alike. The variable is buffa's rather than a
+connect-specific twin precisely so that one setting serves both. It is
+also the only override that reaches `connectrpc-build`, since a build
+script has no plugin parameter string.
+
+**The plugin option is per-plugin.** `buf` gives each plugin its own `opt`
+list, so this raises the bound for `protoc-gen-connect-rust` and nothing
+else — every other plugin in the run needs its own entry:
+
+```yaml
+plugins:
+  - local: protoc-gen-buffa
+    out: src/generated
+    opt:
+      - element_memory_limit=4294967296
+  - local: protoc-gen-connect-rust
+    out: src/generated
+    opt:
+      - element_memory_limit=4294967296
+```
+
+Prefer a byte count to `unlimited`. `unlimited` removes the ceiling
+entirely, so a truncated or corrupt descriptor set stops failing with an
+error and starts exhausting memory instead — on CI that reads as a flaky
+runner rather than a bad input. A generous number keeps the diagnostic.
+
+This bound governs *generation* only, and nothing here reaches a running
+server. A descriptor set handed to a `Reflector` decodes on buffa's
+untrusted-input default with no override: reflection descriptors can come
+from a peer rather than your own build, so the defence stays on. A set
+over that budget reports `ReflectionError::ElementBudget`, and the remedy
+is a smaller set — strip `source_code_info`, or narrow it to the files
+that server reflects.
+
+Request decoding is a different budget again, configured per service
+through `Limits::element_memory_limit`. None of the three read each
+other, so raising the build-time bound has no effect on either.
+
 ## Implementing servers
 
 A service is a Rust trait generated from your `.proto` file. The
@@ -369,7 +433,7 @@ borrowed from the dispatcher-owned body, so the response (and anything
 moved into `tokio::spawn`) cannot borrow from it - call
 `.to_owned_message()` to get the owned struct when you need one. The
 conversion is infallible: buffa charges every unknown-field record
-against the decode-time allowance (since 0.8.1), so a request that
+against the decode-time allowance, so a request that
 decoded successfully always re-materializes.
 
 ### `RequestContext` and `Response`
@@ -742,8 +806,30 @@ while let Some(msg) = stream.message().await? {
     println!("{}", msg.view().value.unwrap_or_default());
 }
 
-// Client streaming - takes a Vec
-let resp = client.sum(vec![req1, req2, req3]).await?;
+// Client streaming - takes an async `Stream` of requests, so messages
+// can be produced as they become available without buffering the whole
+// upload. A ready collection is adapted with `stream_iter` (a re-export
+// of `futures::stream::iter`, so no direct `futures` dependency needed):
+let resp = client
+    .sum(connectrpc::stream_iter(vec![req1, req2, req3]))
+    .await?;
+
+// ...or feed the call from a live producer through a channel-backed
+// stream (add the `tokio-stream` crate for the wrapper). The generated
+// bound, `ClientRequestStream<T>`, is `Stream<Item = T> + Send + 'static`:
+// the stream backs the request body, so yield owned messages rather than
+// borrows of local data.
+let (tx, rx) = tokio::sync::mpsc::channel(16);
+tokio::spawn(async move {
+    while let Some(chunk) = source.recv().await {
+        if tx.send(request_for(chunk)).await.is_err() {
+            break; // call ended — stop producing
+        }
+    }
+});
+let resp = client
+    .sum(tokio_stream::wrappers::ReceiverStream::new(rx))
+    .await?;
 
 // Bidi - received items are `StreamMessage`s too
 let mut bidi = client.running_sum().await?;
@@ -752,6 +838,24 @@ if let Some(reply) = bidi.message().await? {
     println!("{}", reply.view().total.unwrap_or_default());
 }
 bidi.close_send();
+
+// For true full duplex, split the bidi stream into independently owned
+// halves and drive them from separate tasks. Response-dependent sends
+// require an HTTP/2 transport (on HTTP/1.1 no response arrives until the
+// upload completes). Dropping the send half ends the upload cleanly;
+// dropping the receive half cancels the RPC.
+let (mut send, mut recv) = client.running_sum().await?.into_split();
+let reader = tokio::spawn(async move {
+    while let Some(reply) = recv.message().await? {
+        println!("{}", reply.view().total.unwrap_or_default());
+    }
+    Ok::<_, connectrpc::ConnectError>(())
+});
+for req in requests {
+    send.send(req).await?;
+}
+send.close_send();
+reader.await.expect("reader task")?;
 ```
 
 `?` on `message()` is the complete error handling: `Ok(None)` means the
@@ -759,6 +863,12 @@ server finished cleanly, and a terminal RPC error — including a
 gRPC/gRPC-Web stream that ends without a usable `grpc-status` — comes
 back as `Err`, sticky across calls. The `error()` and `trailers()`
 accessors remain available afterwards for post-hoc inspection.
+
+Dropping a client-streaming call cancels it: the request body is dropped
+with the future, so messages the stream had not yet yielded never reach
+the server. Wrapping such a call in a `timeout` therefore abandons the
+upload rather than truncating it cleanly — drive the call to completion
+whenever the request must be delivered.
 
 Both `streaming-tour/src/client.rs` and the eliza example show these
 patterns end-to-end.

@@ -45,6 +45,20 @@ for ::buffa::view::OwnedView<
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
 }
 impl ::connectrpc::Encodable<crate::proto::bench::v1::LogResponse>
 for crate::proto::bench::v1::__buffa::view::LogResponseView<'_> {
@@ -64,6 +78,20 @@ for ::buffa::view::OwnedView<
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 impl ::connectrpc::Encodable<crate::proto::bench::v1::EchoResponse>
@@ -85,6 +113,20 @@ for ::buffa::view::OwnedView<
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
 }
 impl ::connectrpc::Encodable<crate::proto::bench::v1::LogIngestResponse>
 for crate::proto::bench::v1::__buffa::view::LogIngestResponseView<'_> {
@@ -104,6 +146,20 @@ for ::buffa::view::OwnedView<
         codec: ::connectrpc::CodecFormat,
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
     }
 }
 /// Full service name for this service.
@@ -190,7 +246,7 @@ pub const BENCH_SERVICE_LOG_UNARY_OWNED_SPEC: ::connectrpc::Spec = ::connectrpc:
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.9.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -627,6 +683,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BenchRequest,
@@ -646,6 +703,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
@@ -665,6 +723,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,
@@ -699,6 +758,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::BenchRequest,
@@ -734,7 +794,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                 Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
-                    >(requests, format);
+                    >(requests, format, ctx.decode_options().clone());
                     svc.client_stream(ctx, req_stream)
                         .await?
                         .encode::<crate::proto::bench::v1::BenchResponse>(format)
@@ -760,7 +820,7 @@ impl<T: BenchService> ::connectrpc::Dispatcher for BenchServiceServer<T> {
                 Box::pin(async move {
                     let req_stream = ::connectrpc::dispatcher::codegen::decode_message_request_stream::<
                         crate::proto::bench::v1::BenchRequest,
-                    >(requests, format);
+                    >(requests, format, ctx.decode_options().clone());
                     let resp = svc.bidi_stream(ctx, req_stream).await?;
                     Ok(
                         resp
@@ -933,9 +993,24 @@ where
             .await
     }
     /// Call the ClientStream RPC. Sends a request to /bench.v1.BenchService/ClientStream.
+    ///
+    /// `requests` is any `Stream<Item = ...> + Send + 'static` of
+    /// request messages (the `ClientRequestStream` bound); messages
+    /// are sent as the stream yields them. It backs the request
+    /// body, so yield owned messages or feed the call from a
+    /// channel-backed stream. For a collection that is already in
+    /// hand, wrap it with `::connectrpc::stream_iter(...)`.
+    ///
+    /// Dropping the returned future cancels the call: the request
+    /// body is dropped along with it, so messages the stream had
+    /// not yet yielded are never delivered. A caller that needs the
+    /// request delivered must drive the call to completion rather
+    /// than, say, wrapping it in a `timeout`.
     pub async fn client_stream(
         &self,
-        requests: impl IntoIterator<Item = crate::proto::bench::v1::BenchRequest>,
+        requests: impl ::connectrpc::client::ClientRequestStream<
+            crate::proto::bench::v1::BenchRequest,
+        >,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
@@ -951,9 +1026,24 @@ where
             .await
     }
     /// Call the ClientStream RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    ///
+    /// `requests` is any `Stream<Item = ...> + Send + 'static` of
+    /// request messages (the `ClientRequestStream` bound); messages
+    /// are sent as the stream yields them. It backs the request
+    /// body, so yield owned messages or feed the call from a
+    /// channel-backed stream. For a collection that is already in
+    /// hand, wrap it with `::connectrpc::stream_iter(...)`.
+    ///
+    /// Dropping the returned future cancels the call: the request
+    /// body is dropped along with it, so messages the stream had
+    /// not yet yielded are never delivered. A caller that needs the
+    /// request delivered must drive the call to completion rather
+    /// than, say, wrapping it in a `timeout`.
     pub async fn client_stream_with_options(
         &self,
-        requests: impl IntoIterator<Item = crate::proto::bench::v1::BenchRequest>,
+        requests: impl ::connectrpc::client::ClientRequestStream<
+            crate::proto::bench::v1::BenchRequest,
+        >,
         options: ::connectrpc::client::CallOptions,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
@@ -1131,7 +1221,7 @@ pub const ECHO_SERVICE_ECHO_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.9.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -1318,6 +1408,7 @@ impl<T: EchoService> ::connectrpc::Dispatcher for EchoServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::EchoRequest,
@@ -1533,7 +1624,7 @@ pub const LOG_INGEST_SERVICE_INGEST_SPEC: ::connectrpc::Spec = ::connectrpc::Spe
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.9.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -1722,6 +1813,7 @@ impl<T: LogIngestService> ::connectrpc::Dispatcher for LogIngestServiceServer<T>
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::bench::v1::LogRequest,

@@ -24,10 +24,14 @@ bytes = { workspace = true }
 # Tower service abstraction (the foundation)
 tower = { workspace = true }
 
-# Async runtime (minimal features for core)
-tokio = { workspace = true, features = ["rt", "io-util", "sync", "time"] }
+# Async runtime (minimal features for core). `macros` is load-bearing for
+# `tokio::select!` in the `server` accept loop; it stays on the base
+# dependency because CI's `--all-targets` would hide its removal via
+# dev-dep unification while breaking downstream `server`-only builds.
+tokio = { workspace = true, features = ["rt", "io-util", "sync", "time", "macros"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
+sync_wrapper = { workspace = true }
 async-trait = { workspace = true }
 
 # Protobuf.
@@ -42,9 +46,9 @@ async-trait = { workspace = true }
 # explicitly for the same reason: it is in buffa's default set (validated
 # string decoding on the hot path), and `default-features = false` would
 # silently drop it. Keep the version in sync with the
-# `[workspace.dependencies]` `buffa` entry (which documents the 0.8.1 floor —
-# infallible owned conversion needs per-record unknown-field accounting).
-buffa = { version = "0.8.1", default-features = false, features = ["std", "fast-utf8"] }
+# `[workspace.dependencies]` `buffa` entry, which documents why the floor is
+# where it is.
+buffa = { version = "0.9.1", default-features = false, features = ["std", "fast-utf8"] }
 
 # Serialization. Non-optional even in proto-only builds: the Connect error and
 # streaming end-of-stream wire frames are always JSON regardless of the message
@@ -127,10 +131,6 @@ server = [
     "dep:libc",
     "dep:tower-http",
     "tokio/net",
-    # The accept loop uses `tokio::select!`. Surfaced only when downstream
-    # consumers enable `server` without also enabling `tokio/macros`
-    # themselves; `--all-targets` (CI) hides it via dev-dep unification.
-    "tokio/macros",
 ]
 
 # HTTP client with connection pooling

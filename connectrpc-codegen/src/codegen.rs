@@ -18,6 +18,7 @@ use quote::format_ident;
 use quote::quote;
 
 use buffa_codegen::generated::descriptor::DescriptorProto;
+use buffa_codegen::generated::descriptor::Edition;
 use buffa_codegen::generated::descriptor::FileDescriptorProto;
 use buffa_codegen::generated::descriptor::MethodDescriptorProto;
 use buffa_codegen::generated::descriptor::ServiceDescriptorProto;
@@ -59,11 +60,11 @@ pub struct Options {
     /// [`generate_files`] (the unified `super::`-relative path).
     ///
     /// Every `extern_path` target must be buffa-generated code from
-    /// buffa ≥ 0.8.0 with views enabled (and, if the crate feature-gates
+    /// buffa ≥ 0.9.0 with views enabled (and, if the crate feature-gates
     /// its generated impls, with that feature turned on): the service
     /// stubs rely on the `buffa::HasMessageView` impls and `FooOwnedView`
     /// wrappers emitted alongside each message, the same way they rely on
-    /// the JSON/`Serialize` impls. `buffa-types` 0.8+ satisfies this for
+    /// the JSON/`Serialize` impls. `buffa-types` 0.9+ satisfies this for
     /// the well-known types. A crate generated without them fails to
     /// compile against the stubs (missing `HasMessageView` impl).
     pub buffa: CodeGenConfig,
@@ -539,9 +540,9 @@ pub fn generate_services(
 ///   `extern_path=.=<path>` is the catch-all (equivalent to `buffa_module`).
 ///   At least one catch-all mapping is required so every type resolves.
 ///   Every mapped path must point at buffa-generated code from
-///   buffa ≥ 0.8.0 with views enabled — the stubs use the
+///   buffa ≥ 0.9.0 with views enabled — the stubs use the
 ///   `buffa::HasMessageView` impls and owned-view wrappers generated with
-///   each message (`buffa-types` 0.8+ qualifies for the well-known types).
+///   each message (`buffa-types` 0.9+ qualifies for the well-known types).
 /// - `file_per_package` — emit one `<dotted.pkg>.rs` per proto package
 ///   instead of the per-proto split + stitcher. Set `protoc-gen-buffa`'s
 ///   own `file_per_package` option to the same value — the BSR/`tonic`
@@ -585,6 +586,14 @@ pub fn generate_services(
 ///   foreign crate via `extern_path` are still skipped.
 ///   `encodable_impls=outputs` is the explicit default. See
 ///   [`Options::encodable_impls`].
+/// - `element_memory_limit=<bytes|unlimited>` — raises the element-memory
+///   budget used to decode the request, for schemas too large for the
+///   default (see "Very large schemas" in the guide). Accepted and ignored
+///   here: it governs the decode that produced the `CodeGeneratorRequest`,
+///   so `buffa_codegen::decode_request` has already read and applied it by
+///   scanning the wire. A caller who decodes the request itself and then
+///   calls this function must apply the option on that decode; passing it
+///   here alone does nothing.
 ///
 /// # Client-side cfg gate
 ///
@@ -660,6 +669,14 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                          `all_messages` or `outputs`"
                     ),
                 }
+            } else if opt
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == buffa_codegen::ELEMENT_MEMORY_LIMIT_OPT)
+            {
+                // Consumed before this point, by the scan `decode_request` runs
+                // to size the decode that produced `request`. Reaching the
+                // unknown-option arm would reject it from the one caller who
+                // needs it: whoever's schema was too large to decode.
             } else {
                 match opt {
                     "file_per_package" => options.buffa.file_per_package = true,
@@ -672,9 +689,11 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
                             "unknown plugin option: {opt:?}. Supported: \
                              buffa_module=<rust_path>, extern_path=<proto>=<rust>, \
                              encodable_impls=<all_messages|outputs>, \
+                             {mem}=<bytes|unlimited>, \
                              file_per_package, strict_utf8_mapping, no_json, \
                              no_register_fn, gate_client_feature, \
-                             gate_client_feature=<name>"
+                             gate_client_feature=<name>",
+                            mem = buffa_codegen::ELEMENT_MEMORY_LIMIT_OPT
                         ));
                     }
                 }
@@ -695,8 +714,8 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
 
     Ok(CodeGeneratorResponse {
         supported_features: Some(feature_flags()),
-        minimum_edition: Some(EDITION_2023),
-        maximum_edition: Some(EDITION_2023),
+        minimum_edition: Some(Edition::EDITION_2023 as i32),
+        maximum_edition: Some(Edition::EDITION_2024 as i32),
         file: files,
         ..Default::default()
     })
@@ -709,10 +728,6 @@ fn feature_flags() -> u64 {
     const FEATURE_SUPPORTS_EDITIONS: u64 = 2;
     FEATURE_PROTO3_OPTIONAL | FEATURE_SUPPORTS_EDITIONS
 }
-
-/// Edition 2023 numeric value. buffa-codegen handles proto2/proto3/edition-2023;
-/// we declare 2023 as both min and max.
-const EDITION_2023: i32 = 1000;
 
 /// Format a TokenStream into a Rust source string via prettyplease.
 fn format_token_stream(tokens: &TokenStream) -> Result<String> {
@@ -979,7 +994,7 @@ fn alias_collides(batch: &BatchState, current_package: &str, proto_fqn: &str) ->
 /// input type, including ones mapped via `extern_path`: the backing
 /// `buffa::HasMessageView` impl is emitted by buffa's codegen in the crate
 /// that owns the type (`extern_path` targets are required to be generated
-/// with buffa ≥ 0.8.0 and views enabled).
+/// with buffa ≥ 0.9.0 and views enabled).
 fn router_stream_items_tokens(
     resolver: &TypeResolver<'_>,
     method: &MethodDescriptorProto,
@@ -1208,6 +1223,20 @@ fn encodable_impl_pair(
             {
                 ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
             }
+
+            /// An `OwnedView` still holds the buffer it was decoded from, so
+            /// its large fields can be handed to the response body by
+            /// reference count instead of copied. The bare view impl above
+            /// cannot do this: it has borrows but no buffer to name.
+            fn encode_segments(&self, codec: ::connectrpc::CodecFormat)
+                -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError>
+            {
+                ::connectrpc::__codegen::encode_view_body_segments(
+                    self.reborrow(),
+                    self.bytes(),
+                    codec,
+                )
+            }
         }
     }))
 }
@@ -1359,7 +1388,7 @@ fn generate_service(
          `StreamMessage<M>` implements `Encodable<M>`.\n\n\
          Request types resolved through `extern_path` (e.g. well-known types\n\
          from another crate) use the same wrappers; the crate that owns the\n\
-         type must be generated with buffa ≥ 0.8.0 and views enabled so the\n\
+         type must be generated with buffa ≥ 0.9.0 and views enabled so the\n\
          backing `HasMessageView` impl exists.\n\n\
          The `impl Encodable<Out>` return bound accepts the owned `Out`, the\n\
          generated `OutView<'_>` / `OwnedOutView`,\n\
@@ -1875,7 +1904,7 @@ fn generate_service_server(
         let stream_decode = {
             let input_fqn = m.input_type.as_deref().unwrap_or("");
             let input_owned = resolver.rust_type(input_fqn, package)?;
-            quote! { ::connectrpc::dispatcher::codegen::decode_message_request_stream::<#input_owned>(requests, format) }
+            quote! { ::connectrpc::dispatcher::codegen::decode_message_request_stream::<#input_owned>(requests, format, ctx.decode_options().clone()) }
         };
 
         if cs && ss {
@@ -1916,7 +1945,7 @@ fn generate_service_server(
                         // The normalized body is owned by this future; the handler
                         // borrows from it until it returns the response stream.
                         let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request, format)?;
-                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body)?;
+                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body, ctx.decode_options())?;
                         #call_handler
                         Ok(resp.map_body(|s| ::connectrpc::dispatcher::codegen::encode_response_stream::<#output_type, _, _>(s, format)))
                     })
@@ -1941,7 +1970,7 @@ fn generate_service_server(
                         // The normalized body is owned by this future; the handler
                         // borrows from it for the duration of the call.
                         let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<#input_owned>(request.encoded()?, format)?;
-                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body)?;
+                        let req: #input_view<'_> = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(&body, ctx.decode_options())?;
                         #call_handler
                     })
                 }
@@ -2242,9 +2271,26 @@ fn generate_client_method(
     let short_args: TokenStream; // args to the no-opts convenience method
     let opts_args: TokenStream; // args to the _with_options method
     let short_delegate_args: TokenStream; // how short delegates to opts
+    // Extra doc lines appended to both methods (client-stream input contract).
+    let mut extra_doc = quote! {};
 
     if client_streaming && !server_streaming {
         // Client-stream
+        extra_doc = quote! {
+            #[doc = ""]
+            #[doc = " `requests` is any `Stream<Item = ...> + Send + 'static` of"]
+            #[doc = " request messages (the `ClientRequestStream` bound); messages"]
+            #[doc = " are sent as the stream yields them. It backs the request"]
+            #[doc = " body, so yield owned messages or feed the call from a"]
+            #[doc = " channel-backed stream. For a collection that is already in"]
+            #[doc = " hand, wrap it with `::connectrpc::stream_iter(...)`."]
+            #[doc = ""]
+            #[doc = " Dropping the returned future cancels the call: the request"]
+            #[doc = " body is dropped along with it, so messages the stream had"]
+            #[doc = " not yet yielded are never delivered. A caller that needs the"]
+            #[doc = " request delivered must drive the call to completion rather"]
+            #[doc = " than, say, wrapping it in a `timeout`."]
+        };
         ret_ty = quote! {
             Result<
                 ::connectrpc::client::UnaryResponse<::buffa::view::OwnedView<#output_view_type<'static>>>,
@@ -2258,8 +2304,9 @@ fn generate_client_method(
                 requests, options,
             ).await
         };
-        short_args = quote! { requests: impl IntoIterator<Item = #input_type> };
-        opts_args = quote! { requests: impl IntoIterator<Item = #input_type>, options: ::connectrpc::client::CallOptions };
+        short_args =
+            quote! { requests: impl ::connectrpc::client::ClientRequestStream<#input_type> };
+        opts_args = quote! { requests: impl ::connectrpc::client::ClientRequestStream<#input_type>, options: ::connectrpc::client::CallOptions };
         short_delegate_args = quote! { requests, ::connectrpc::client::CallOptions::default() };
     } else if client_streaming && server_streaming {
         // Bidi
@@ -2320,11 +2367,13 @@ fn generate_client_method(
 
     Ok(quote! {
         #[doc = #doc]
+        #extra_doc
         pub async fn #method_snake(&self, #short_args) -> #ret_ty {
             self.#method_with_opts(#short_delegate_args).await
         }
 
         #[doc = #doc_opts]
+        #extra_doc
         pub async fn #method_with_opts(&self, #opts_args) -> #ret_ty {
             #call_body
         }
@@ -2386,15 +2435,20 @@ fn find_comment(source_info: &SourceCodeInfo, target_path: &[i32]) -> Option<Str
                 .as_ref()
                 .or(location.trailing_comments.as_ref())?;
 
-            // Trim each line; blank lines are dropped (protoc's convention
-            // uses a leading space we don't need here — `doc_attrs` adds
-            // its own uniform leading space for prettyplease rendering).
-            let cleaned: String = comment
+            // protoc strips the `//` marker but keeps the space that follows
+            // it; drop that one space per line while preserving deeper
+            // indentation (code blocks) and blank lines (paragraph breaks).
+            // `doc_attrs` adds its own uniform leading space for
+            // prettyplease rendering.
+            let normalized: String = comment
                 .lines()
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
+                .map(|line| line.strip_prefix(' ').unwrap_or(line).trim_end())
                 .collect::<Vec<_>>()
                 .join("\n");
+
+            // Escape markdown/HTML metacharacters so arbitrary proto
+            // comments can't break the consumer's rustdoc build.
+            let cleaned = crate::comments::sanitize_comment(normalized.trim_matches('\n'));
 
             if !cleaned.is_empty() {
                 return Some(cleaned);
@@ -2715,7 +2769,7 @@ mod tests {
         );
         // `.google.protobuf.Empty` resolves through the default extern_path to
         // `::buffa_types::…`. extern_path targets are required to be
-        // buffa ≥ 0.8.0 generated code with views enabled, so the unary input
+        // buffa ≥ 0.9.0 generated code with views enabled, so the unary input
         // uses the same `ServiceRequest<'_, Req>` form as local types — the
         // backing `buffa::HasMessageView` impl ships with buffa-types.
         assert!(
@@ -4332,11 +4386,13 @@ mod tests {
             .iter()
             .find(|f| f.name == "ping.__connect.rs")
             .expect("service companion");
-        // Count impl bodies (one `encode_view_body` call each) rather than
-        // `impl ::connectrpc::Encodable<` — that string also appears in the
-        // trait method's return-position bound.
+        // Count impl bodies rather than `impl ::connectrpc::Encodable<` —
+        // that string also appears in the trait method's return-position
+        // bound. Match `encode_view_body(` with the paren so the
+        // `encode_view_body_segments` override on the OwnedView impl is not
+        // counted as a second body.
         assert_eq!(
-            companion.content.matches("encode_view_body").count(),
+            companion.content.matches("encode_view_body(").count(),
             4,
             "exactly one impl pair per message (PingReq + PingResp), \
              no E0119 duplicates: {}",
@@ -4430,7 +4486,7 @@ mod tests {
         assert_eq!(pkg_mod.kind, GeneratedFileKind::PackageMod);
         assert_eq!(pkg_mod.name, "common.v1.rs");
         assert_eq!(
-            pkg_mod.content.matches("encode_view_body").count(),
+            pkg_mod.content.matches("encode_view_body(").count(),
             2,
             "impl pair inlined into the package file: {}",
             pkg_mod.content
@@ -4474,7 +4530,7 @@ mod tests {
             .find(|f| f.kind == GeneratedFileKind::PackageMod && f.package == "common.v1")
             .expect("PackageMod for common.v1");
         assert_eq!(
-            pkg_mod.content.matches("encode_view_body").count(),
+            pkg_mod.content.matches("encode_view_body(").count(),
             2,
             "impl pair inlined into the package file: {}",
             pkg_mod.content
@@ -4600,6 +4656,28 @@ mod tests {
             msg.contains("unknown plugin option"),
             "error should say the option is unknown: {msg}"
         );
+    }
+
+    /// `element_memory_limit` is read off the wire before the request is
+    /// decoded, so by the time options are parsed it is a leftover. Rejecting
+    /// it would fail the build of the only person who ever sets it — someone
+    /// whose schema was too large to decode without it.
+    #[test]
+    fn plugin_accepts_the_element_memory_limit_option_it_consumed_pre_decode() {
+        for value in ["unlimited", "max", "2147483648"] {
+            let request = CodeGeneratorRequest {
+                parameter: Some(format!(
+                    "buffa_module=crate::proto,{}={value}",
+                    buffa_codegen::ELEMENT_MEMORY_LIMIT_OPT
+                )),
+                file_to_generate: vec![],
+                proto_file: vec![],
+                ..Default::default()
+            };
+            generate(&request).unwrap_or_else(|e| {
+                panic!("element_memory_limit={value} must not reach the unknown-option arm: {e}")
+            });
+        }
     }
 
     #[test]
@@ -4809,5 +4887,16 @@ mod tests {
 
         let chat = render(&consts[3]);
         assert!(chat.contains("StreamType::BidiStream"), "{chat}");
+    }
+
+    #[test]
+    fn declares_edition_2024_support() {
+        // protoc refuses to run a generator against a file whose edition
+        // falls outside the advertised range, so this declaration is the
+        // whole of edition support for a service generator.
+        let response = generate(&CodeGeneratorRequest::default())
+            .expect("an empty request still yields a response carrying the edition range");
+        assert_eq!(response.minimum_edition, Some(Edition::EDITION_2023 as i32));
+        assert_eq!(response.maximum_edition, Some(Edition::EDITION_2024 as i32));
     }
 }

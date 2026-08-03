@@ -455,7 +455,21 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// incrementally from the body stream — the full body is never buffered.
 /// In that case `max_request_body_size` does not apply, and
 /// `max_message_size` is the primary per-message protection.
+///
+/// `element_memory_limit` is the odd one out, and the distinction from
+/// `max_message_size` is the one worth getting right: `max_message_size`
+/// bounds *decompressed bytes on the wire*, while `element_memory_limit`
+/// bounds the *in-memory footprint of the element count* those bytes ask
+/// for. A repeated field of empty messages costs two bytes each encoded and
+/// a whole struct each decoded, so a body comfortably inside
+/// `max_message_size` can still expand by orders of magnitude. Raising one
+/// does not raise the other.
+///
+/// These are **server** limits, applied to received requests. A client
+/// decoding responses currently uses buffa's defaults, with no equivalent
+/// override.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Limits {
     /// Maximum size of the request body on the wire (before decompression).
     ///
@@ -476,6 +490,22 @@ pub struct Limits {
     ///
     /// Default: 4 MB.
     pub max_message_size: usize,
+
+    /// Maximum memory a single decode may commit to repeated, map, string
+    /// and bytes *elements*.
+    ///
+    /// This is an amplification defence, and it is charged on element
+    /// footprint rather than on contents: a few bytes on the wire can ask
+    /// the decoder to materialize a very large number of small elements,
+    /// each with its own allocation overhead, while staying well under
+    /// `max_message_size`. A single large payload is unaffected however big
+    /// it grows, because its contents are not charged.
+    ///
+    /// Raise it for a trusted peer that legitimately sends messages with
+    /// very many small elements; lower it to tighten the defence.
+    ///
+    /// Default: 32 MiB (buffa's `DEFAULT_ELEMENT_MEMORY_LIMIT`).
+    pub element_memory_limit: usize,
 }
 
 impl Default for Limits {
@@ -483,6 +513,7 @@ impl Default for Limits {
         Self {
             max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            element_memory_limit: buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
         }
     }
 }
@@ -495,6 +526,7 @@ impl Limits {
         Self {
             max_request_body_size: usize::MAX,
             max_message_size: usize::MAX,
+            element_memory_limit: usize::MAX,
         }
     }
 
@@ -517,6 +549,24 @@ impl Limits {
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
+    }
+
+    /// Set the maximum memory a single decode may commit to repeated, map,
+    /// string and bytes elements.
+    ///
+    /// See [`Limits`] for what this charges and why it is separate from
+    /// `max_message_size`.
+    #[must_use]
+    pub fn element_memory_limit(mut self, bytes: usize) -> Self {
+        self.element_memory_limit = bytes;
+        self
+    }
+
+    /// The buffa decode options these limits imply.
+    #[doc(hidden)] // read by generated dispatch via `RequestContext`
+    #[must_use]
+    pub fn decode_options(&self) -> buffa::DecodeOptions {
+        buffa::DecodeOptions::new().with_element_memory_limit(self.element_memory_limit)
     }
 }
 
@@ -943,6 +993,13 @@ struct BatchingEnvelopeStream {
     finalizer: StreamFinalizer,
     /// Finalizer frame staged for the next poll (when buf was non-empty at end).
     pending_final: Option<Frame<Bytes>>,
+    /// Large payload (post-compression, when negotiated) staged for the next
+    /// poll: emitted as its
+    /// own data frame (refcount clone) right after the header flush, instead
+    /// of being copied into `buf`. See [`EnvelopeEncoder::encode_chained`].
+    ///
+    /// [`EnvelopeEncoder::encode_chained`]: crate::envelope::EnvelopeEncoder::encode_chained
+    pending_payload: Option<Bytes>,
     /// Fused-done flag.
     done: bool,
 }
@@ -962,6 +1019,7 @@ impl BatchingEnvelopeStream {
             trailers,
             finalizer,
             pending_final: None,
+            pending_payload: None,
             done: false,
         }
     }
@@ -977,10 +1035,15 @@ impl Stream for BatchingEnvelopeStream {
     type Item = Result<Frame<Bytes>, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        use tokio_util::codec::Encoder;
-
         if self.done {
             return Poll::Ready(None);
+        }
+
+        // Staged large payload from a prior poll — its envelope header was
+        // already flushed, so this must precede everything else (including
+        // a staged finalizer).
+        if let Some(payload) = self.pending_payload.take() {
+            return Poll::Ready(Some(Ok(Frame::data(payload))));
         }
 
         // Staged finalizer from a prior poll (buf was non-empty at stream end).
@@ -1031,22 +1094,36 @@ impl Stream for BatchingEnvelopeStream {
                 }
                 Poll::Ready(Some(Ok(data))) => {
                     let me = &mut *self;
-                    if let Err(err) = me.encoder.encode(data, &mut me.buf) {
-                        // Envelope encoding/compression failed mid-stream.
-                        // The buffer may contain prior successfully-encoded
-                        // envelopes — don't drop them.
-                        tracing::debug!(
-                            error = %err,
-                            "streaming response: envelope encoding failed"
-                        );
-                        let final_frame = self.finalizer.error(&err, &self.trailers);
-                        if self.buf.is_empty() {
-                            self.done = true;
-                            return Poll::Ready(Some(Ok(final_frame)));
-                        } else {
-                            self.pending_final = Some(final_frame);
+                    match me.encoder.encode_chained(
+                        data,
+                        &mut me.buf,
+                        crate::envelope::MIN_CHAIN_SIZE,
+                    ) {
+                        Err(err) => {
+                            // Envelope encoding/compression failed mid-stream.
+                            // The buffer may contain prior successfully-encoded
+                            // envelopes — don't drop them.
+                            tracing::debug!(
+                                error = %err,
+                                "streaming response: envelope encoding failed"
+                            );
+                            let final_frame = self.finalizer.error(&err, &self.trailers);
+                            if self.buf.is_empty() {
+                                self.done = true;
+                                return Poll::Ready(Some(Ok(final_frame)));
+                            } else {
+                                self.pending_final = Some(final_frame);
+                                return Poll::Ready(Some(Ok(self.flush_buf())));
+                            }
+                        }
+                        Ok(Some(payload)) => {
+                            // Large payload: `buf` now ends with
+                            // its 5-byte envelope header. Flush the buffer and
+                            // stage the payload as the next frame, unmoved.
+                            self.pending_payload = Some(payload);
                             return Poll::Ready(Some(Ok(self.flush_buf())));
                         }
+                        Ok(None) => {}
                     }
                     if self.buf.len() >= STREAM_BATCH_THRESHOLD {
                         return Poll::Ready(Some(Ok(self.flush_buf())));
@@ -1124,6 +1201,9 @@ fn create_grpc_web_envelope_stream(
 /// By default, the service applies security limits to prevent DoS attacks:
 /// - Request body: 4 MB (on-wire, before decompression)
 /// - Message size: 4 MB (after decompression, applied uniformly)
+/// - Element memory: 32 MiB per decode (the footprint of repeated, map,
+///   string and bytes elements, which a small body can inflate — see
+///   [`Limits`])
 ///
 /// These can be configured using [`with_limits`](Self::with_limits):
 ///
@@ -1287,12 +1367,23 @@ impl<D: Dispatcher> ConnectRpcService<D> {
 
 /// A lightweight body for gRPC unary responses.
 ///
-/// Yields exactly two frames: one data frame (the gRPC envelope) and one
-/// trailers frame (for gRPC) or a second data frame (for gRPC-Web trailer encoding).
+/// Yields one data frame carrying the gRPC envelope — or, for a large
+/// response, just its 5-byte header followed by one data frame per payload
+/// segment, each passed through by refcount — then one trailers frame (for
+/// gRPC) or a final data frame (for gRPC-Web trailer encoding).
 /// This avoids the overhead of `Pin<Box<dyn Stream>>` + `stream::unfold` +
 /// `EnvelopeEncoder` for the common unary case.
 pub struct GrpcUnaryBody {
     data: Option<Bytes>,
+    /// Large message payload (post-compression, when negotiated) emitted as
+    /// its own data frame after `data` (which then carries only the 5-byte
+    /// envelope header), so the payload is passed through by refcount
+    /// instead of copied.
+    ///
+    /// More than one when the encoder handed back several segments — a view
+    /// re-encode captures each large borrowed field separately rather than
+    /// gathering them, so they stay separate all the way to the socket.
+    payload: std::collections::VecDeque<Bytes>,
     trailers: Option<GrpcUnaryTrailers>,
 }
 
@@ -1315,6 +1406,8 @@ impl Body for GrpcUnaryBody {
         let me = self.get_mut();
         if let Some(data) = me.data.take() {
             Poll::Ready(Some(Ok(Frame::data(data))))
+        } else if let Some(payload) = me.payload.pop_front() {
+            Poll::Ready(Some(Ok(Frame::data(payload))))
         } else if let Some(trailers) = me.trailers.take() {
             match trailers {
                 GrpcUnaryTrailers::Http2(map) => Poll::Ready(Some(Ok(Frame::trailers(map)))),
@@ -1837,7 +1930,8 @@ where
         // The leading slash was stripped for the Dispatcher::lookup key;
         // restore it so RequestContext::path() matches http::Uri::path()
         // and Spec::procedure.
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
     let resp: EncodedResponse = with_request_deadline(
@@ -1854,17 +1948,25 @@ where
 
     // Compress response body if negotiated, respecting the compression policy
     let effective_policy = compression_policy.with_override(resp.compress);
+    // Connect unary flattens. Compression needs one contiguous input, and the
+    // uncompressed case would need `Full<Bytes>` replaced with a multi-frame
+    // body to carry segments — Connect puts the message straight in the HTTP
+    // body, so nothing here splits it for us the way an envelope does. The
+    // segmented encode therefore reaches only gRPC and gRPC-Web unary.
+    // Flattening is a no-op unless the encoder segmented.
+    let body_len = resp.body.len();
+    let resp_body = resp.body.into_contiguous();
     let (final_body, content_encoding) = if let Some(encoding) = response_encoding {
-        if !effective_policy.should_compress(resp.body.len()) {
-            (resp.body, None)
-        } else {
-            match compression.compress(encoding, &resp.body) {
+        if effective_policy.should_compress(body_len) {
+            match compression.compress(encoding, &resp_body) {
                 Ok(compressed) => (compressed, Some(encoding)),
-                Err(_) => (resp.body, None), // Fall back to uncompressed
+                Err(_) => (resp_body, None), // Fall back to uncompressed
             }
+        } else {
+            (resp_body, None)
         }
     } else {
-        (resp.body, None)
+        (resp_body, None)
     };
 
     // Build response with the same content type as the request
@@ -1954,11 +2056,13 @@ where
         }
         let body = GrpcUnaryBody {
             data: None,
+            payload: std::collections::VecDeque::new(),
             trailers: Some(trailers),
         };
         response.body(body).unwrap_or_else(|_| {
             Response::new(GrpcUnaryBody {
                 data: None,
+                payload: std::collections::VecDeque::new(),
                 trailers: None,
             })
         })
@@ -2061,7 +2165,8 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with the same deadline used while receiving the body.
     let resp = match with_request_deadline(
@@ -2087,17 +2192,30 @@ where
         metadata.streaming_encoding.as_deref(),
     );
 
-    // Encode response into a gRPC envelope (5-byte header + payload)
+    // Encode response into a gRPC envelope (5-byte header + payload). Large
+    // payloads are chained (header segment + payload by
+    // refcount) rather than copied into a contiguous buffer.
     let effective_policy = compression_policy.with_override(resp.compress);
-    let encoded_data = if let Some(encoding) = response_encoding
+    let min_chain = crate::envelope::MIN_CHAIN_SIZE;
+    let (encoded_data, chained_payload) = if let Some(encoding) = response_encoding
         && effective_policy.should_compress(resp.body.len())
     {
-        match compression.compress(encoding, &resp.body) {
-            Ok(compressed) => Envelope::compressed(compressed).encode(),
-            Err(_) => Envelope::data(resp.body).encode(),
+        // Compression needs one contiguous input and produces one contiguous
+        // output, so any segmentation the encoder managed ends here. That is
+        // the right trade: the compressor was going to read every byte anyway.
+        let flat = resp.body.into_contiguous();
+        match compression.compress(encoding, &flat) {
+            Ok(compressed) => Envelope::encode_body_parts(
+                crate::envelope::flags::COMPRESSED,
+                compressed.into(),
+                min_chain,
+            ),
+            Err(_) => {
+                Envelope::encode_body_parts(crate::envelope::flags::DATA, flat.into(), min_chain)
+            }
         }
     } else {
-        Envelope::data(resp.body).encode()
+        Envelope::encode_body_parts(crate::envelope::flags::DATA, resp.body, min_chain)
     };
 
     // Build gRPC trailers
@@ -2132,6 +2250,7 @@ where
 
     let body = GrpcUnaryBody {
         data: Some(encoded_data),
+        payload: chained_payload.into(),
         trailers: Some(trailers),
     };
 
@@ -2362,7 +2481,8 @@ where
         .with_extensions(extensions)
         .with_spec(method_desc.and_then(|d| d.spec))
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with the appropriate codec format.
     // For gRPC unary handlers, we wrap the single response in a one-item stream.
@@ -2392,8 +2512,13 @@ where
             );
             match with_request_deadline(deadline, fut).await {
                 // Wrap single response in a one-item stream
-                Ok(r) => r.map_body(|bytes| -> BoxStream<Result<Bytes, ConnectError>> {
-                    Box::pin(futures::stream::once(async move { Ok(bytes) }))
+                // The streaming machinery carries contiguous message bytes,
+                // and re-enveloping happens per item downstream, so a
+                // client-streaming response flattens here.
+                Ok(r) => r.map_body(|body| -> BoxStream<Result<Bytes, ConnectError>> {
+                    Box::pin(futures::stream::once(
+                        async move { Ok(body.into_contiguous()) },
+                    ))
                 }),
                 Err(e) => return streaming_error_response(&e, protocol, codec_format),
             }
@@ -2500,7 +2625,8 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler. On error paths, the reader task is left running
     // (detached) so it can finish draining the request body — aborting it
@@ -2575,7 +2701,9 @@ where
 
     let stream_compression = response_encoding.map(|encoding| (compression, encoding));
     let response_stream: BoxStream<Result<Bytes, ConnectError>> =
-        Box::pin(futures::stream::once(async { Ok(resp.body) }));
+        Box::pin(futures::stream::once(async {
+            Ok(resp.body.into_contiguous())
+        }));
     let effective_policy = compression_policy.with_override(resp.compress);
     let body = StreamingResponseBody::new(
         response_stream,
@@ -2904,7 +3032,8 @@ where
         .with_extensions(extensions)
         .with_spec(spec)
         .with_protocol(Some(protocol))
-        .with_path(format!("/{path}"));
+        .with_path(format!("/{path}"))
+        .with_decode_options(limits.decode_options());
 
     // Call the handler with timeout if configured
     let handler_result = if let Some(timeout) = metadata.timeout {
@@ -3264,6 +3393,172 @@ pub mod axum_integration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A payload at or above `envelope::MIN_CHAIN_SIZE` must reach the body
+    /// frames by refcount, not by copy: the emitted data frame references
+    /// the handler's original allocation. Small envelopes (the 5-byte
+    /// header) still batch into the framing buffer.
+    #[tokio::test]
+    async fn streaming_large_payload_is_chained_not_copied() {
+        use futures::StreamExt as _;
+
+        let payload = Bytes::from(vec![0x42u8; crate::envelope::MIN_CHAIN_SIZE]);
+        let original_ptr = payload.as_ptr();
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        // Frame 1: the 5-byte envelope header (batched buffer flush).
+        let head = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(head.len(), crate::envelope::HEADER_SIZE);
+        assert_eq!(head[0], crate::envelope::flags::DATA);
+        assert_eq!(
+            u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize,
+            payload.len()
+        );
+
+        // Frame 2: the payload, by refcount — same allocation, no copy.
+        let data = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(data.len(), payload.len());
+        assert!(
+            std::ptr::eq(data.as_ptr(), original_ptr),
+            "payload frame must reference the original allocation"
+        );
+
+        // Frame 3: gRPC trailers.
+        let trailers = stream.next().await.unwrap().unwrap();
+        assert!(trailers.is_trailers());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Payloads below the chaining threshold are emitted as one
+    /// contiguous data frame containing header + payload.
+    #[tokio::test]
+    async fn streaming_small_payload_stays_contiguous() {
+        use futures::StreamExt as _;
+
+        let payload = Bytes::from_static(b"small");
+        let source = futures::stream::iter([Ok::<_, ConnectError>(payload.clone())]).boxed();
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let frame = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(frame.len(), crate::envelope::HEADER_SIZE + payload.len());
+        assert_eq!(&frame[crate::envelope::HEADER_SIZE..], &payload[..]);
+
+        let trailers = stream.next().await.unwrap().unwrap();
+        assert!(trailers.is_trailers());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// The chained split must be invisible to an envelope decoder: bytes
+    /// reassembled from the frames decode identically to the contiguous path.
+    #[tokio::test]
+    async fn streaming_chained_frames_reassemble_to_same_wire_bytes() {
+        use futures::StreamExt as _;
+
+        let large = Bytes::from(vec![0x5Au8; crate::envelope::MIN_CHAIN_SIZE + 7]);
+        let small = Bytes::from_static(b"tail");
+        let items = [
+            Ok::<_, ConnectError>(small.clone()),
+            Ok(large.clone()),
+            Ok(small.clone()),
+        ];
+        let source = futures::stream::iter(items).boxed();
+        let mut stream = std::pin::pin!(create_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let mut wire = bytes::BytesMut::new();
+        while let Some(frame) = stream.next().await {
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                wire.extend_from_slice(&data);
+            }
+        }
+
+        // Decode all envelopes back out and compare to the source messages.
+        let mut decoded = Vec::new();
+        while let Some(env) = Envelope::decode(&mut wire).unwrap() {
+            decoded.push(env);
+        }
+        assert_eq!(decoded.len(), 4, "3 data envelopes + 1 end-stream");
+        assert_eq!(decoded[0].data, small);
+        assert_eq!(decoded[1].data, large);
+        assert_eq!(decoded[2].data, small);
+        assert!(decoded[3].is_end_stream());
+    }
+
+    /// A source error right after a chained payload must still emit the
+    /// staged payload before the error finalizer: header frame, payload
+    /// frame, then trailers.
+    #[tokio::test]
+    async fn streaming_error_after_chained_payload_preserves_order() {
+        use futures::StreamExt as _;
+
+        let large = Bytes::from(vec![0x77u8; crate::envelope::MIN_CHAIN_SIZE]);
+        let items = [
+            Ok::<_, ConnectError>(large.clone()),
+            Err(ConnectError::internal("boom")),
+        ];
+        let source = futures::stream::iter(items).boxed();
+        let mut stream = std::pin::pin!(create_grpc_envelope_stream(
+            source,
+            http::HeaderMap::new(),
+            None,
+            CompressionPolicy::disabled(),
+        ));
+
+        let head = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(head.len(), crate::envelope::HEADER_SIZE);
+        let payload = stream.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(payload, large);
+        let trailers = stream.next().await.unwrap().unwrap();
+        let map = trailers.into_trailers().unwrap();
+        assert_eq!(map.get("grpc-status").unwrap(), "13", "internal = 13");
+        assert!(stream.next().await.is_none());
+    }
+
+    /// GrpcUnaryBody with a chained payload yields header, payload, then
+    /// trailers, in that order; the payload frame is the original
+    /// allocation.
+    #[tokio::test]
+    async fn grpc_unary_body_chained_frame_order() {
+        use http_body_util::BodyExt as _;
+
+        let payload = Bytes::from(vec![0x33u8; crate::envelope::MIN_CHAIN_SIZE]);
+        let ptr = payload.as_ptr();
+        let (head, chained) = Envelope::encode_body_parts(
+            crate::envelope::flags::DATA,
+            payload.clone().into(),
+            crate::envelope::MIN_CHAIN_SIZE,
+        );
+        let mut body = GrpcUnaryBody {
+            data: Some(head.clone()),
+            payload: chained.into(),
+            trailers: Some(GrpcUnaryTrailers::Http2(http::HeaderMap::new())),
+        };
+
+        let f1 = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(f1, head);
+        assert_eq!(f1.len(), crate::envelope::HEADER_SIZE);
+        let f2 = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert!(std::ptr::eq(f2.as_ptr(), ptr), "payload must not be copied");
+        let f3 = body.frame().await.unwrap().unwrap();
+        assert!(f3.is_trailers());
+        assert!(body.frame().await.is_none());
+    }
 
     #[test]
     fn test_service_creation() {

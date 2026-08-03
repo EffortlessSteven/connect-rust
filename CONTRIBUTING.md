@@ -131,7 +131,7 @@ and the three client suites.
 
 ## Checked-In Generated Code
 
-Five directories contain checked-in `buf generate` output and **must be
+Six directories contain checked-in `buf generate` output and **must be
 regenerated** whenever `connectrpc-codegen` output changes (or the buffa
 dependency is bumped):
 
@@ -140,6 +140,7 @@ dependency is bumped):
 - `examples/multiservice/src/generated/`
 - `benches/rpc/src/generated/`
 - `connectrpc-health/src/generated/`
+- `connectrpc-reflection/src/generated/`
 
 Regenerate all of them with:
 
@@ -185,6 +186,10 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push to
 - **MSRV** — `cargo check` on the minimum toolchain, read from `rust-version`
   in the workspace `Cargo.toml` so the declaration and the check cannot drift
 - **Examples** — builds and runs the example crates
-- **Minimal features** — `cargo check -p connectrpc --no-default-features`
+- **Minimal features** — `cargo check` *and* `cargo test`, both
+  `-p connectrpc --no-default-features`. Because the tests run, a test that
+  needs `json`, `gzip`, `zstd` or `streaming` must be
+  `#[cfg(feature = "...")]`-gated or it fails here while passing the
+  default-feature suite
 - **Wasm** — `wasm32-unknown-unknown` build of the client example
 - **Conformance (server)** / **Conformance (client)** — full suites

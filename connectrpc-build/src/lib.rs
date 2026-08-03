@@ -4,7 +4,11 @@
 //! build time. It shells out to `protoc` (or `buf`, or reads a precompiled
 //! `FileDescriptorSet`) to obtain descriptors, then runs
 //! [`connectrpc_codegen`] to emit buffa message types plus ConnectRPC
-//! service traits and clients into `$OUT_DIR`.
+//! service traits and clients into `$OUT_DIR`. Comments in the `.proto`
+//! source are carried into the generated Rust as doc comments, as long as
+//! the descriptors carry source info — the protoc and buf sources always
+//! do, but a precompiled set must be built with it (see
+//! [`Config::descriptor_set`]).
 //!
 //! # Example
 //!
@@ -268,7 +272,8 @@ impl Config {
     /// and `buf.yaml` configuration; [`Config::includes`] is ignored. When
     /// using buf, [`Config::files`] must contain proto-relative names as
     /// they appear in the buf module (e.g. `"my/service.proto"`), not
-    /// filesystem paths.
+    /// filesystem paths. buf includes source info by default, so proto
+    /// comments become generated doc comments, same as the protoc source.
     #[must_use]
     pub fn use_buf(mut self) -> Self {
         self.descriptor_source = DescriptorSource::Buf;
@@ -280,7 +285,9 @@ impl Config {
     ///
     /// Produce the file once with `protoc --descriptor_set_out=... --include_imports`
     /// or `buf build --as-file-descriptor-set -o ...`, then ship it with
-    /// your source.
+    /// your source. Add `--include_source_info` to the `protoc` invocation
+    /// if you want proto comments carried into the generated Rust docs
+    /// (buf includes source info by default).
     ///
     /// [`Config::files`] selects which files in the set to generate code for.
     /// **These must be the proto-relative names as they appear in the
@@ -318,6 +325,12 @@ impl Config {
     /// The inverse of [`Config::descriptor_set`], which *reads* a precompiled
     /// set; this *writes* the one connectrpc-build already computed, so build
     /// scripts no longer need a second `protoc --descriptor_set_out` pass.
+    ///
+    /// For the protoc and buf sources, `SourceCodeInfo` (proto comments and
+    /// spans) is stripped from the emitted set — reflection does not need it,
+    /// and stripping keeps the embedded bytes lean and proto comments out of
+    /// shipped binaries. A precompiled set is written through byte-for-byte;
+    /// use that source if you need the emitted set to carry source info.
     #[must_use]
     pub fn emit_descriptor_set(mut self, name: impl Into<String>) -> Self {
         self.emit_descriptor_set = Some(name.into());
@@ -398,8 +411,15 @@ impl Config {
                 (bytes, proto_relative_names(&self.files))
             }
         };
-        let fds = FileDescriptorSet::decode_from_slice(&descriptor_bytes)
-            .map_err(|e| anyhow!("failed to decode FileDescriptorSet: {e}"))?;
+        // 2. Decode the descriptor set.
+        //
+        // The compiler's own output — protoc or buf that this build script just
+        // ran, or a descriptor set the build points at — so buffa's tooling
+        // bound applies rather than its untrusted-input default.
+        let decode_options = buffa_codegen::tooling_decode_options().map_err(|e| anyhow!("{e}"))?;
+        let mut fds = decode_options
+            .decode_from_slice::<FileDescriptorSet>(&descriptor_bytes)
+            .map_err(|e| descriptor_decode_error(&e, decode_options.element_memory_limit()))?;
 
         // 3. Generate.
         let generated = codegen::generate_files(&fds.file, &files_to_generate, &self.options)?;
@@ -411,9 +431,9 @@ impl Config {
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("failed to create out_dir '{}'", out_dir.display()))?;
 
-        // Emit the parsed descriptor set for gRPC server reflection, if requested.
-        // `descriptor_bytes` already carries the full import closure for every
-        // descriptor source, so the written set is reflection-ready as-is.
+        // Emit the descriptor set for gRPC server reflection, if requested.
+        // The decoded set carries the full import closure for every
+        // descriptor source, so the written set is reflection-ready.
         if let Some(name) = &self.emit_descriptor_set {
             // `<out_dir>/<name>` is the documented contract; a separator or
             // absolute path would silently escape it via `Path::join`.
@@ -424,7 +444,22 @@ impl Config {
                 );
             }
             let target = out_dir.join(name);
-            write_if_changed(&target, &descriptor_bytes)
+            // For the sets this crate builds itself, strip `SourceCodeInfo`
+            // before writing: reflection never needs it, and passing it
+            // through would bloat the embedded bytes and leak proto comments
+            // into consumer binaries. A precompiled set is user-curated, so
+            // it is written through byte-for-byte. Codegen has already run,
+            // so mutating `fds` here is safe.
+            let emit_bytes = match &self.descriptor_source {
+                DescriptorSource::Protoc | DescriptorSource::Buf => {
+                    for file in &mut fds.file {
+                        file.source_code_info = Default::default();
+                    }
+                    fds.encode_to_vec()
+                }
+                DescriptorSource::Precompiled(_) => descriptor_bytes,
+            };
+            write_if_changed(&target, &emit_bytes)
                 .with_context(|| format!("failed to write descriptor set {}", target.display()))?;
         }
 
@@ -456,6 +491,16 @@ impl Config {
         if !self.emit_rerun_directives {
             return Ok(());
         }
+        // The decode above reads this, so it is a build input like any source
+        // file. Emitting any `rerun-if` directive narrows cargo to exactly the
+        // triggers listed, so without this a build that succeeded with the
+        // variable set is not re-run when it changes or is unset — the stale
+        // output is reused and the setting looks inert. Only the failing
+        // direction self-heals, because a failed build script always re-runs.
+        println!(
+            "cargo:rerun-if-env-changed={}",
+            buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV
+        );
         match &self.descriptor_source {
             DescriptorSource::Precompiled(p) => {
                 println!("cargo:rerun-if-changed={}", p.display());
@@ -482,6 +527,27 @@ impl Default for Config {
     }
 }
 
+/// Describe a descriptor-set decode failure for a build script.
+///
+/// buffa composes the base text, including the budget actually in force. For
+/// an over-budget set it also names two remedies, and only one of them is
+/// reachable from here — a build script has no plugin parameter string — so
+/// this says which, and points at the connectrpc guide rather than buffa's.
+fn descriptor_decode_error(e: &buffa::DecodeError, limit: usize) -> anyhow::Error {
+    let base = buffa_codegen::decode_failure("FileDescriptorSet", e, limit);
+    if matches!(e, buffa::DecodeError::ElementMemoryLimitExceeded) {
+        anyhow!(
+            "{base}\nOf those two, only the {env} environment variable applies to a \
+             build script, which has no plugin parameter string. See \"Very large \
+             schemas\" in the connectrpc guide: \
+             https://github.com/connectrpc/connect-rust/blob/main/docs/guide.md",
+            env = buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV,
+        )
+    } else {
+        anyhow!(base)
+    }
+}
+
 /// Write `content` to `path` only if the file doesn't already exist with
 /// identical content. Cargo's rebuild decision for `include!`-ed files is
 /// mtime-based, so an unconditional write here would cascade into
@@ -504,6 +570,9 @@ fn run_protoc(files: &[PathBuf], includes: &[PathBuf]) -> Result<Vec<u8>> {
 
     let mut cmd = Command::new(&protoc);
     cmd.arg("--include_imports");
+    // Without this, the descriptor set carries no `SourceCodeInfo` and proto
+    // comments never reach the generated Rust docs.
+    cmd.arg("--include_source_info");
     cmd.arg(format!("--descriptor_set_out={}", out_path.display()));
     for inc in includes {
         cmd.arg(format!("--proto_path={}", inc.display()));
@@ -873,6 +942,97 @@ mod tests {
             "default emission must not emit any cfg attr — external \
              consumers should not need to declare a `client` Cargo \
              feature unless they opt in. Got:\n{ungated}"
+        );
+    }
+
+    /// Protoc mode must pass `--include_source_info` so proto comments
+    /// survive into the generated Rust as doc comments (issue #222).
+    /// Unlike the fixture-driven tests above, this one requires `protoc`
+    /// on PATH — a documented prerequisite of the workspace test suite.
+    #[test]
+    fn protoc_mode_preserves_proto_comments() {
+        let proto_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proto_dir.path().join("commented.proto"),
+            r#"syntax = "proto3";
+package commented;
+
+// DistinctiveMessageComment documents the Note message.
+message Note {
+  // DistinctiveFieldComment documents the text field.
+  string text = 1;
+}
+
+// DistinctiveServiceComment: see [Note] and map<string, int32>.
+service NoteService {
+  // DistinctiveMethodComment: docs at http://example.com/notes here.
+  rpc GetNote(Note) returns (Note);
+}
+"#,
+        )
+        .unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        Config::new()
+            .files(&[proto_dir.path().join("commented.proto")])
+            .includes(&[proto_dir.path()])
+            .out_dir(out.path())
+            .emit_rerun_directives(false)
+            .emit_descriptor_set("commented.bin")
+            .compile()
+            .expect("compile in protoc mode");
+
+        let generated =
+            std::fs::read_to_string(out.path().join("commented.rs")).expect("read commented.rs");
+        for marker in ["DistinctiveMessageComment", "DistinctiveFieldComment"] {
+            assert!(
+                generated.contains(&format!("/// {marker}")),
+                "expected proto comment `{marker}` as a doc comment in the \
+                 generated Rust — was the descriptor built without \
+                 --include_source_info?\n{generated}"
+            );
+        }
+
+        // Service and method comments flow through connectrpc-codegen's
+        // sanitizer: markdown/HTML metacharacters must be escaped and bare
+        // URLs autolinked so hostile proto comments can't break a
+        // consumer's rustdoc build.
+        let connect = std::fs::read_to_string(out.path().join("commented.__connect.rs"))
+            .expect("read commented.__connect.rs");
+        for expected in [
+            r"/// DistinctiveServiceComment: see \[Note\] and map\<string, int32\>.",
+            "/// DistinctiveMethodComment: docs at <http://example.com/notes> here.",
+        ] {
+            assert!(
+                connect.contains(expected),
+                "expected sanitized doc comment `{expected}` in generated \
+                 service code\n{connect}"
+            );
+        }
+
+        // The emitted reflection set must NOT carry the source info codegen
+        // consumed: reflection doesn't need it, and it would leak proto
+        // comments into consumer binaries. The rest of the descriptor
+        // content must survive the strip's decode→re-encode round trip.
+        let bytes = std::fs::read(out.path().join("commented.bin")).unwrap();
+        let emitted = FileDescriptorSet::decode_from_slice(&bytes).unwrap();
+        assert!(
+            emitted
+                .file
+                .iter()
+                .all(|f| f.source_code_info.as_option().is_none()),
+            "emitted descriptor set must have SourceCodeInfo stripped"
+        );
+        let file = emitted
+            .file
+            .iter()
+            .find(|f| f.name.as_deref() == Some("commented.proto"))
+            .expect("emitted set must retain commented.proto");
+        assert!(
+            file.message_type
+                .iter()
+                .any(|m| m.name.as_deref() == Some("Note")),
+            "emitted set must retain the Note message"
         );
     }
 
@@ -1269,5 +1429,95 @@ mod tests {
 
         write_if_changed(&path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// Build a descriptor set that overruns buffa's default element-memory
+    /// budget. The budget charges `size_of::<FileDescriptorProto>()` per
+    /// element rather than encoded bytes, so many tiny files trip it while
+    /// staying small on the wire — which is exactly why descriptor sets hit it
+    /// at a few megabytes. Derived from the live size, because a literal count
+    /// stops overrunning the budget the moment that struct shrinks — see
+    /// `connectrpc::test_budget` for the full rationale and the buffa 0.9.1
+    /// change that proved it.
+    fn over_default_budget_set() -> Vec<u8> {
+        use buffa_codegen::generated::descriptor::FileDescriptorProto;
+
+        let per_element = std::mem::size_of::<FileDescriptorProto>();
+        let n = (buffa::DEFAULT_ELEMENT_MEMORY_LIMIT / per_element) * 5 / 4;
+        let set = FileDescriptorSet {
+            file: (0..n)
+                .map(|i| FileDescriptorProto {
+                    name: Some(format!("f{i}.proto")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        buffa::Message::encode_to_vec(&set)
+    }
+
+    /// The regression this crate's decode path exists to prevent: a build's
+    /// own descriptors must decode even when they exceed the bound sized for
+    /// untrusted wire input.
+    ///
+    /// The first assertion is the control. Without it the second would pass
+    /// whether or not the tooling options do anything at all.
+    #[test]
+    fn the_tooling_options_decode_a_set_the_untrusted_default_rejects() {
+        let bytes = over_default_budget_set();
+
+        assert!(
+            matches!(
+                FileDescriptorSet::decode_from_slice(&bytes),
+                Err(buffa::DecodeError::ElementMemoryLimitExceeded)
+            ),
+            "fixture no longer exceeds the default budget ({} encoded bytes); \
+             it must, or the assertion below proves nothing",
+            bytes.len()
+        );
+
+        let opts = buffa_codegen::tooling_decode_options().expect("no override set");
+        opts.decode_from_slice::<FileDescriptorSet>(&bytes)
+            .expect("a build's own descriptors must decode under the tooling budget");
+    }
+
+    /// An over-budget failure has to correct buffa's hint, which offers a
+    /// plugin option that cannot be set from a build script.
+    #[test]
+    fn an_over_budget_decode_names_only_the_remedy_a_build_script_has() {
+        let rendered = descriptor_decode_error(
+            &buffa::DecodeError::ElementMemoryLimitExceeded,
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+        )
+        .to_string();
+
+        assert!(
+            rendered.contains(buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV),
+            "must name the variable that works here: {rendered}"
+        );
+        assert!(
+            rendered.contains("build script"),
+            "must say why the plugin option does not apply: {rendered}"
+        );
+        assert!(
+            rendered.contains("connectrpc/connect-rust"),
+            "must point at our guide, not buffa's: {rendered}"
+        );
+    }
+
+    /// A malformed set must not be dressed up as a budget problem — that
+    /// would send someone raising a limit that cannot help.
+    #[test]
+    fn a_malformed_set_is_not_reported_as_a_budget_problem() {
+        let rendered = descriptor_decode_error(
+            &buffa::DecodeError::UnexpectedEof,
+            buffa::DEFAULT_ELEMENT_MEMORY_LIMIT,
+        )
+        .to_string();
+
+        assert!(
+            !rendered.contains(buffa_codegen::ELEMENT_MEMORY_LIMIT_ENV),
+            "a truncated set must not point at the budget: {rendered}"
+        );
     }
 }

@@ -118,6 +118,53 @@ use buffa::view::HasMessageView;
 use buffa::view::MessageView;
 use buffa::view::OwnedView;
 use buffa::view::ViewReborrow;
+/// Re-export of [`futures::Stream`] (the `futures` 0.3 / `futures-core` 0.3
+/// trait), which [`ClientRequestStream`] builds on. Re-exported so generic
+/// code can name the trait without a direct `futures` dependency.
+pub use futures::Stream;
+/// Re-export of [`futures::stream::iter`]: adapts a collection that is
+/// already in hand into a request stream for a client-streaming call,
+/// without a direct `futures` dependency.
+pub use futures::stream::iter as stream_iter;
+
+mod sealed {
+    pub trait Sealed {}
+    impl<S> Sealed for S where S: super::Stream + Send + 'static {}
+}
+
+/// The request-stream bound for client-streaming calls.
+///
+/// Implemented automatically for every `Stream<Item = Req> + Send + 'static`
+/// — it cannot (and never needs to) be implemented by hand. The trait exists
+/// so the compiler can point at the two usual fixes when the bound is not
+/// met: wrap a ready collection with [`stream_iter`], and make a borrowing
+/// stream yield owned messages (the stream backs the request body, which can
+/// outlive the call frame and move across threads — hence `Send + 'static`).
+///
+/// Not to be confused with the server-side
+/// [`dispatcher::RequestStream`](crate::dispatcher::RequestStream), a boxed
+/// stream of raw request bytes.
+///
+/// # Panics in `poll_next`
+///
+/// The stream backs the request body, so it is polled on the task driving
+/// the HTTP request rather than on the caller's. A panic in `poll_next`
+/// therefore does not propagate to the caller: it surfaces as a generic
+/// transport error, and where that driver task is shared between calls
+/// (such as [`SharedHttp2Connection`]) it can fault every RPC on that
+/// connection, not just this one. The stream yields `Req`, not a
+/// `Result`, so it has no channel for reporting its own failure: end the
+/// stream early instead of panicking, and surface the reason through your
+/// own application protocol.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as the request stream of a client-streaming call",
+    label = "expected an async `Stream<Item = {Req}> + Send + 'static`",
+    note = "for a collection that is already in hand, wrap it with `connectrpc::stream_iter(...)`",
+    note = "the stream backs the request body, so it must be `Send + 'static`: yield owned messages (no borrows of local data) or feed the call from a channel-backed stream"
+)]
+pub trait ClientRequestStream<Req>: sealed::Sealed + Stream<Item = Req> + Send + 'static {}
+
+impl<S, Req> ClientRequestStream<Req> for S where S: Stream<Item = Req> + Send + 'static {}
 
 use crate::codec::CodecFormat;
 use crate::codec::content_type;
@@ -1409,18 +1456,12 @@ where
     /// for callers that also need the response's header and trailer
     /// metadata.
     ///
-    /// Infallible: an [`OwnedView`] body can only be built by buffa's wire
-    /// decoder, and buffa (≥ 0.8.1) charges every unknown-field record
-    /// against the decode-time allowance, so a view that decoded
-    /// successfully re-materializes within that same allowance, and known
-    /// fields were already validated at decode.
+    /// Infallible: [`OwnedView::to_owned_message`] cannot fail, because an
+    /// `OwnedView` can only come from buffa's wire decoder and conversion
+    /// replays under the budget the decode already charged.
     #[must_use]
     pub fn into_owned_parts(self) -> (http::HeaderMap, V::Owned, http::HeaderMap) {
-        let owned = self
-            .body
-            .to_owned_message()
-            .expect("wire-decoded view always converts (buffa >= 0.8.1)");
-        (self.headers, owned, self.trailers)
+        (self.headers, self.body.to_owned_message(), self.trailers)
     }
 }
 
@@ -2755,6 +2796,12 @@ where
 ///
 /// Errors that occur during the stream (e.g., in gRPC trailers or the
 /// END_STREAM envelope) are returned by [`ServerStream::message()`].
+///
+/// # Cancellation
+///
+/// Dropping the returned future or hitting its deadline drops the in-flight
+/// transport send with it, so a request that had not finished sending may
+/// never reach the server.
 pub async fn call_server_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
@@ -2955,9 +3002,9 @@ where
 
 /// A request body that pulls envelope-encoded frames from an mpsc channel.
 ///
-/// Used as the request body for bidirectional and client-streaming calls.
-/// [`BidiStream::send`] pushes encoded envelopes to the channel's sender half;
-/// dropping the sender (via [`BidiStream::close_send`]) closes the body,
+/// Used as the request body for bidirectional streaming calls.
+/// [`BidiSendHalf::send`] pushes encoded envelopes to the channel's sender;
+/// dropping the sender (via [`BidiSendHalf::close_send`]) closes the body,
 /// signalling EOF to the server.
 struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, ConnectError>>,
@@ -2977,7 +3024,91 @@ impl Body for ChannelBody {
     }
 }
 
-/// State machine for the receive side of a [`BidiStream`].
+/// A request body that lazily encodes messages from the caller's stream
+/// into envelope frames as the transport polls for body data.
+///
+/// Used by [`call_client_stream`]: making the stream *be* the body hands
+/// upload liveness to the HTTP layer. The transport polls for the next
+/// frame only while it can send (backpressure is HTTP/2 flow control), a
+/// server that ends the RPC early makes the transport stop polling and
+/// drop the body, and a server that sends response headers early while
+/// still reading the upload keeps receiving frames — none of which needs a
+/// library-side pump loop.
+///
+/// The stream is held in a [`sync_wrapper::SyncWrapper`] so the body is
+/// `Sync` (as [`ClientBody`]'s boxing requires) without demanding `Sync`
+/// of the caller's stream — the wrapper only ever hands out `&mut` access.
+#[pin_project::pin_project]
+struct EncodingBody<S> {
+    #[pin]
+    stream: sync_wrapper::SyncWrapper<S>,
+    encoder: crate::envelope::EnvelopeEncoder,
+    codec_format: CodecFormat,
+    /// Mirror of an encode error also emitted through the body, letting the
+    /// call report the precise error instead of a transport-level failure.
+    error: std::sync::Arc<std::sync::Mutex<Option<ConnectError>>>,
+    /// Set on an encode error or stream exhaustion; the body then reports
+    /// end-of-stream without polling the (possibly non-fused) stream again.
+    done: bool,
+}
+
+impl<S, Req> Body for EncodingBody<S>
+where
+    S: Stream<Item = Req>,
+    Req: buffa::Message + crate::codec::JsonSerialize,
+{
+    type Data = Bytes;
+    type Error = ConnectError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, ConnectError>>> {
+        use std::task::Poll;
+
+        let this = self.project();
+        if *this.done {
+            return Poll::Ready(None);
+        }
+
+        let Some(request) = std::task::ready!(this.stream.get_pin_mut().poll_next(cx)) else {
+            // `Stream` gives no post-`None` guarantee, so never poll the
+            // (possibly non-fused) stream again.
+            *this.done = true;
+            return Poll::Ready(None);
+        };
+
+        let mut record_error = |err: &ConnectError| {
+            *this.done = true;
+            *this
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.clone());
+        };
+
+        let msg_bytes = match this.codec_format {
+            CodecFormat::Proto => request.encode_to_bytes(),
+            CodecFormat::Json => match encode_json(&request) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    record_error(&err);
+                    return Poll::Ready(Some(Err(err)));
+                }
+            },
+        };
+
+        let mut envelope_buf = BytesMut::new();
+        match tokio_util::codec::Encoder::encode(this.encoder, msg_bytes, &mut envelope_buf) {
+            Ok(()) => Poll::Ready(Some(Ok(http_body::Frame::data(envelope_buf.freeze())))),
+            Err(err) => {
+                record_error(&err);
+                Poll::Ready(Some(Err(err)))
+            }
+        }
+    }
+}
+
+/// State machine for [`BidiRecvHalf`], the receive side of a [`BidiStream`].
 ///
 /// The transport send is spawned so the HTTP request makes progress
 /// immediately (connect, handshake, start streaming the request body from
@@ -2993,8 +3124,9 @@ impl Body for ChannelBody {
 /// HEADERS, then constructs the [`ServerStream`]. Both pending operations stay
 /// in this state machine while awaited, so cancelling `message()` does not
 /// discard either the response task or a suspended construction step such as
-/// Connect error-body parsing. Dropping the whole [`BidiStream`] (or failing
-/// the call at its deadline) aborts the in-flight task instead.
+/// Connect error-body parsing. Dropping the [`BidiRecvHalf`] that owns this
+/// state (or failing the call at its deadline) aborts the in-flight task
+/// instead.
 enum RecvState<B, RespView> {
     /// Request initiated in a spawned task; response HEADERS not yet
     /// received. Awaiting the handle yields the [`Response`] once hyper
@@ -3021,6 +3153,9 @@ enum RecvState<B, RespView> {
 /// respect the protocol in use. On HTTP/1.1, calling `message()` before
 /// `close_send()` will block until the request body is complete.
 ///
+/// To drive the two sides from separate tasks, split the stream into
+/// independently owned halves with [`into_split()`](Self::into_split).
+///
 /// # Cancellation
 ///
 /// Dropping the `BidiStream` cancels the call: any in-flight initialization
@@ -3045,24 +3180,69 @@ enum RecvState<B, RespView> {
 /// }
 /// ```
 pub struct BidiStream<B, Req, RespView> {
-    // Send side
+    // Field order is load-bearing for drop: `send` drops first (clean
+    // request-body EOF), then `recv`'s Drop aborts any in-flight
+    // initialization task. The glue between the two field drops is
+    // synchronous, so the spawned task cannot advance in between — the
+    // abort still catches anything the old whole-struct Drop would have.
+    send: BidiSendHalf<Req>,
+    recv: BidiRecvHalf<B, RespView>,
+}
+
+// Manual impl: delegate to the halves, which carry the useful state.
+impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BidiStream")
+            .field("send", &self.send)
+            .field("recv", &self.recv)
+            .finish()
+    }
+}
+
+/// The send half of a [`BidiStream`], returned by
+/// [`BidiStream::into_split`].
+///
+/// Owns the request side of the RPC: [`send()`](Self::send) and
+/// [`close_send()`](Self::close_send). Dropping the half without calling
+/// `close_send` closes the send side the same way (the request body ends
+/// cleanly); the RPC itself stays alive as long as the [`BidiRecvHalf`]
+/// does. The halves cannot be recombined into a [`BidiStream`].
+pub struct BidiSendHalf<Req> {
     tx: Option<tokio::sync::mpsc::Sender<Result<Bytes, ConnectError>>>,
     encoder: crate::envelope::EnvelopeEncoder,
     codec_format: CodecFormat,
+    /// Copy of the whole-call deadline; checked before each send.
+    deadline: Option<std::time::Instant>,
+    _req: PhantomData<Req>,
+}
 
-    // Receive side — state machine: AwaitingHeaders -> Constructing -> Ready or Failed
+impl<Req> std::fmt::Debug for BidiSendHalf<Req> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BidiSendHalf")
+            .field("send_closed", &self.tx.is_none())
+            .field("codec_format", &self.codec_format)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The receive half of a [`BidiStream`], returned by
+/// [`BidiStream::into_split`].
+///
+/// Owns the response side of the RPC: [`message()`](Self::message) plus the
+/// [`headers()`](Self::headers), [`trailers()`](Self::trailers), and
+/// [`error()`](Self::error) accessors. Dropping this half cancels the RPC
+/// (any in-flight initialization task is aborted and the transport stream
+/// is reset), after which sends on the [`BidiSendHalf`] fail. The halves
+/// cannot be recombined into a [`BidiStream`].
+pub struct BidiRecvHalf<B, RespView> {
+    // State machine: AwaitingHeaders -> Constructing -> Ready or Failed
     recv: RecvState<B, RespView>,
     /// Config snapshot for constructing ServerStream when headers arrive.
     /// Captured by value (not &) because the stream outlives call_bidi_stream.
     stream_config: StreamConfig,
-
-    _req: PhantomData<Req>,
 }
 
-// Manual impl: the body type inside `ServerStream` typically isn't `Debug`,
-// and the JoinHandle's inner type wouldn't format usefully anyway. Print
-// send-channel state, recv-state discriminant, and any receive error.
-impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
+impl<B, RespView> std::fmt::Debug for BidiRecvHalf<B, RespView> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (recv_state, recv_error) = match &self.recv {
             RecvState::AwaitingHeaders(_) => ("AwaitingHeaders", None),
@@ -3070,8 +3250,7 @@ impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
             RecvState::Ready(_) => ("Ready", None),
             RecvState::Failed(err) => ("Failed", Some(err)),
         };
-        f.debug_struct("BidiStream")
-            .field("send_closed", &self.tx.is_none())
+        f.debug_struct("BidiRecvHalf")
             .field("recv_state", &recv_state)
             .field("protocol", &self.stream_config.protocol)
             .field("codec_format", &self.stream_config.codec_format)
@@ -3080,13 +3259,14 @@ impl<B, Req, RespView> std::fmt::Debug for BidiStream<B, Req, RespView> {
     }
 }
 
-// Dropping the stream aborts any in-flight initialization task. Without
-// this, a task left in `AwaitingHeaders` or `Constructing` would detach on
-// drop and — absent a call deadline — could be pinned indefinitely by a
-// server that stalls response HEADERS or a Connect error body without ever
-// ending the stream. Abandoning the stream abandons the RPC, so nothing can
-// consume the task's result anyway.
-impl<B, Req, RespView> Drop for BidiStream<B, Req, RespView> {
+// Dropping the receive half aborts any in-flight initialization task.
+// Without this, a task left in `AwaitingHeaders` or `Constructing` would
+// detach on drop and — absent a call deadline — could be pinned indefinitely
+// by a server that stalls response HEADERS or a Connect error body without
+// ever ending the stream. Abandoning the receive half abandons the RPC, so
+// nothing can consume the task's result anyway. (This also covers dropping
+// a whole `BidiStream`, which contains this half.)
+impl<B, RespView> Drop for BidiRecvHalf<B, RespView> {
     fn drop(&mut self) {
         match &self.recv {
             RecvState::AwaitingHeaders(task) => task.abort(),
@@ -3107,24 +3287,24 @@ struct StreamConfig {
     deadline: Option<std::time::Instant>,
 }
 
-impl<B, Req, RespView> BidiStream<B, Req, RespView>
+impl<Req> BidiSendHalf<Req>
 where
-    B: Body<Data = Bytes> + Send + Unpin,
-    B::Error: std::fmt::Display,
     Req: buffa::Message + crate::codec::JsonSerialize,
-    RespView: MessageView<'static> + Send,
-    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
 {
     /// Send a request message.
     ///
+    /// # Errors
+    ///
     /// Returns an error if [`close_send`](Self::close_send) was already
     /// called, if the whole-call deadline has passed, or if the server has
-    /// closed the stream (the receiver half was dropped). In the latter
-    /// case, call [`message()`](Self::message) to retrieve the server's error.
+    /// closed the stream. In the latter case, receive on the other half —
+    /// [`BidiRecvHalf::message()`] — to retrieve the server's error. (The
+    /// same error is returned when the [`BidiRecvHalf`] was dropped, which
+    /// cancels the RPC.)
     pub async fn send(&mut self, msg: Req) -> Result<(), ConnectError> {
         // Check the whole-call deadline before each send, matching
         // connect-go's ctx.Err() check in duplexHTTPCall.Send().
-        if let Some(d) = self.stream_config.deadline
+        if let Some(d) = self.deadline
             && std::time::Instant::now() >= d
         {
             return Err(ConnectError::deadline_exceeded(
@@ -3157,11 +3337,20 @@ where
     /// Close the send side of the stream. Idempotent.
     ///
     /// After this, only receiving is possible. For half-duplex use
-    /// (HTTP/1.1), this must be called before [`message()`](Self::message).
+    /// (HTTP/1.1), this must be called before receiving. Dropping the half
+    /// has the same effect.
     pub fn close_send(&mut self) {
         self.tx = None; // drop sender → channel closes → body signals EOF
     }
+}
 
+impl<B, RespView> BidiRecvHalf<B, RespView>
+where
+    B: Body<Data = Bytes> + Send + Unpin,
+    B::Error: std::fmt::Display,
+    RespView: MessageView<'static> + Send,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
+{
     /// Receive the next response message.
     ///
     /// The first call awaits response headers (lazily, so full-duplex
@@ -3170,6 +3359,8 @@ where
     /// If this future is dropped while response initialization is still pending,
     /// the initialization remains in the stream and the next `message()` call
     /// resumes it. Actual initialization failures remain terminal and sticky.
+    ///
+    /// # Errors
     ///
     /// Returns `Ok(None)` only when the server finished **cleanly**; a
     /// server error carried in the termination metadata is returned as
@@ -3308,6 +3499,111 @@ where
     }
 }
 
+impl<B, Req, RespView> BidiStream<B, Req, RespView> {
+    /// Split the stream into independently owned send and receive halves,
+    /// so the two sides can be driven from separate tasks (full duplex).
+    ///
+    /// Interleaved, response-dependent use — receiving an answer before
+    /// sending the next message — requires an HTTP/2 transport, exactly as
+    /// with an unsplit stream: on HTTP/1.1 no response arrives until the
+    /// request body is complete, so a task waiting on the other half's
+    /// progress deadlocks. Prefer moving each half into its own spawned
+    /// task (as below) over storing them in named struct fields — the
+    /// halves' full type parameters include the transport body type, which
+    /// task-local inference names for you.
+    ///
+    /// The halves are plain moves of the stream's two sides — no locking is
+    /// added — and there is no way to reassemble them. Semantics carried by
+    /// each half:
+    ///
+    /// - Dropping the [`BidiSendHalf`] (or calling
+    ///   [`close_send()`](BidiSendHalf::close_send)) ends the request body
+    ///   cleanly; the RPC continues until the receive half finishes.
+    /// - Dropping the [`BidiRecvHalf`] cancels the RPC — as when dropping a
+    ///   whole `BidiStream` — after which sends on the other half fail.
+    /// - When [`send()`](BidiSendHalf::send) fails because the server closed
+    ///   the stream, the server's error is retrieved from the *receive* half
+    ///   via [`message()`](BidiRecvHalf::message).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (mut send, mut recv) = stream.into_split();
+    /// let reader = tokio::spawn(async move {
+    ///     while let Some(msg) = recv.message().await? {
+    ///         println!("got: {msg:?}");
+    ///     }
+    ///     Ok::<_, connectrpc::ConnectError>(())
+    /// });
+    /// for req in requests {
+    ///     send.send(req).await?;
+    /// }
+    /// send.close_send();
+    /// reader.await.expect("reader task")?;
+    /// ```
+    #[must_use]
+    pub fn into_split(self) -> (BidiSendHalf<Req>, BidiRecvHalf<B, RespView>) {
+        (self.send, self.recv)
+    }
+}
+
+impl<B, Req, RespView> BidiStream<B, Req, RespView>
+where
+    B: Body<Data = Bytes> + Send + Unpin,
+    B::Error: std::fmt::Display,
+    Req: buffa::Message + crate::codec::JsonSerialize,
+    RespView: MessageView<'static> + Send,
+    RespView::Owned: buffa::Message + crate::codec::JsonDeserialize,
+{
+    /// Send a request message.
+    ///
+    /// # Errors
+    ///
+    /// See [`BidiSendHalf::send`] for the error contract.
+    pub async fn send(&mut self, msg: Req) -> Result<(), ConnectError> {
+        self.send.send(msg).await
+    }
+
+    /// Close the send side of the stream. Idempotent.
+    /// See [`BidiSendHalf::close_send`].
+    pub fn close_send(&mut self) {
+        self.send.close_send();
+    }
+
+    /// Receive the next response message.
+    ///
+    /// # Errors
+    ///
+    /// See [`BidiRecvHalf::message`] for the full contract.
+    pub async fn message<M>(&mut self) -> Result<Option<crate::StreamMessage<M>>, ConnectError>
+    where
+        B: 'static,
+        RespView: MessageView<'static, Owned = M> + 'static,
+        M: HasMessageView<View<'static> = RespView>,
+    {
+        self.recv.message().await
+    }
+
+    /// Response headers. See [`BidiRecvHalf::headers`].
+    #[must_use]
+    pub fn headers(&self) -> Option<&http::HeaderMap> {
+        self.recv.headers()
+    }
+
+    /// Trailing metadata. See [`BidiRecvHalf::trailers`].
+    #[must_use]
+    pub fn trailers(&self) -> Option<&http::HeaderMap> {
+        self.recv.trailers()
+    }
+
+    /// Terminal error that ended the stream, if any.
+    /// See [`BidiRecvHalf::error`].
+    #[must_use]
+    pub fn error(&self) -> Option<&ConnectError> {
+        self.recv.error()
+    }
+}
+
 /// Make a bidirectional-streaming RPC call.
 ///
 /// Opens a stream to the server and returns a [`BidiStream`] handle for
@@ -3402,18 +3698,23 @@ where
     });
 
     Ok(BidiStream {
-        tx: Some(tx),
-        encoder,
-        codec_format: config.codec_format,
-        recv: RecvState::AwaitingHeaders(response_task),
-        stream_config: StreamConfig {
-            protocol: config.protocol,
+        send: BidiSendHalf {
+            tx: Some(tx),
+            encoder,
             codec_format: config.codec_format,
-            compression: config.compression.clone(),
-            max_message_size: options.max_message_size,
             deadline,
+            _req: PhantomData,
         },
-        _req: PhantomData,
+        recv: BidiRecvHalf {
+            recv: RecvState::AwaitingHeaders(response_task),
+            stream_config: StreamConfig {
+                protocol: config.protocol,
+                codec_format: config.codec_format,
+                compression: config.compression.clone(),
+                max_message_size: options.max_message_size,
+                deadline,
+            },
+        },
     })
 }
 
@@ -3423,18 +3724,57 @@ where
 /// envelope-framed response with END_STREAM. Returns a [`UnaryResponse`] containing
 /// the decoded response message along with headers and trailers.
 ///
-/// The request body is streamed: each item from the iterator is encoded into
-/// an envelope and pushed to a bounded mpsc channel that backs the HTTP
-/// request body. The transport begins sending as soon as the first envelope
-/// is ready instead of waiting for the iterator to be fully drained, so peak
-/// memory stays around `channel_depth * envelope_size` rather than the full
-/// concatenated body.
+/// The request body IS the stream: each item yielded by `requests` is
+/// encoded into an envelope frame as the transport asks for the next chunk
+/// of body data. The transport begins sending as soon as the first message
+/// is available, backpressure is the HTTP layer's own flow control, and
+/// peak memory stays around one envelope rather than the full concatenated
+/// body.
+///
+/// `requests` is an asynchronous [`Stream`], so messages can be produced as
+/// they become available (paced by timers, read from sockets, forwarded from
+/// channels) without buffering the whole request up front. The
+/// [`ClientRequestStream`] bound additionally requires `Send + 'static`
+/// because the stream backs the request body, which can outlive the call
+/// frame and move across threads — yield owned messages (no borrows of
+/// local data), or feed the call from a channel-backed stream. For a
+/// collection that is already in hand, wrap it with [`stream_iter`]:
+///
+/// ```rust,ignore
+/// let resp = call_client_stream(
+///     &transport, &config, "svc", "Method",
+///     connectrpc::stream_iter(vec![req1, req2]),
+///     CallOptions::default(),
+/// ).await?;
+/// ```
+///
+/// Because the transport owns the polling of `requests`, upload liveness
+/// follows HTTP semantics: a server that ends the RPC while `requests` is
+/// still pending (for example, rejecting the call partway through the
+/// upload) produces a response and the call returns without draining the
+/// stream, while a server that merely sends response headers early and
+/// keeps consuming the upload keeps receiving messages.
+///
+/// # Cancellation
+///
+/// Dropping the returned future (caller cancellation) or letting its deadline
+/// expire drops the in-flight transport send — and with it the request body
+/// and the caller's stream — even if the transport is still waiting for
+/// response headers. As a consequence, a request that was still being sent
+/// when the call was abandoned may never reach the server; a caller that
+/// needs the request delivered must drive the call to completion.
+///
+/// # Errors
+///
+/// Returns an error if a request message cannot be encoded, the transport
+/// fails, the whole-call deadline expires, the server responds with an
+/// error, or the response cannot be decoded.
 pub async fn call_client_stream<T, Req, RespView>(
     transport: &T,
     config: &ClientConfig,
     service: &str,
     method: &str,
-    requests: impl IntoIterator<Item = Req>,
+    requests: impl ClientRequestStream<Req>,
     options: CallOptions,
 ) -> Result<UnaryResponse<OwnedView<RespView>>, ConnectError>
 where
@@ -3454,21 +3794,31 @@ where
         .parse()
         .map_err(|e| ConnectError::internal(format!("invalid URI: {e}")))?;
 
-    // Channel-backed request body. Depth 32 matches `call_bidi_stream` and
-    // gives natural backpressure on HTTP/2 flow control.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ConnectError>>(32);
-    let body: ClientBody = ChannelBody { rx }.boxed();
-
     let compression_for_encoder = config.request_compression.as_ref().map(|enc| {
         (
             std::sync::Arc::new(config.compression.clone()),
             enc.as_str(),
         )
     });
-    let mut encoder = crate::envelope::EnvelopeEncoder::new(
+    let encoder = crate::envelope::EnvelopeEncoder::new(
         compression_for_encoder,
         config.compression_policy.with_override(options.compress),
     );
+
+    // The stream backs the request body directly: the transport polls it for
+    // the next frame as it is able to send. An encode failure is reported
+    // through the body (aborting the request) and stashed here so the call
+    // can surface the precise error instead of a generic transport failure.
+    let encode_error: std::sync::Arc<std::sync::Mutex<Option<ConnectError>>> =
+        std::sync::Arc::default();
+    let body: ClientBody = EncodingBody {
+        stream: sync_wrapper::SyncWrapper::new(requests),
+        encoder,
+        codec_format: config.codec_format,
+        error: encode_error.clone(),
+        done: false,
+    }
+    .boxed();
 
     // Compute deadline BEFORE sending, matching Go's ctx.Deadline() semantics
     let deadline = client_deadline(options.timeout, config.protocol);
@@ -3487,51 +3837,19 @@ where
         .body(body)
         .map_err(|e| ConnectError::internal(format!("failed to build request: {e}")))?;
 
-    // Drive the transport send concurrently with the iterator drain below.
-    // Without this, a transport whose send() future contains the actual I/O
-    // would not read from the channel until awaited, deadlocking once the
-    // channel filled. The response is bridged back via a oneshot so the
-    // awaitee is uniform across architectures.
-    let response_fut = transport.send(http_request);
-    let (resp_tx, resp_rx) =
-        tokio::sync::oneshot::channel::<Result<Response<T::ResponseBody>, ConnectError>>();
-    let _ = crate::spawn_detached(async move {
-        let result = response_fut
+    // Enforce the client-side deadline on send + parse. The transport polls
+    // the request body (and therefore the caller's stream) while this send
+    // future — or, for connection-driver transports, their background task —
+    // makes progress; there is no library-side pump that could hang on an
+    // idle stream or cut off an upload the server is still consuming.
+    // Abandonment (dropping the call future, or the deadline firing) drops
+    // the send future — and with it the request — directly: there is no
+    // detached task to outlive the call (#224).
+    let result = with_deadline(deadline, async {
+        let response = transport
+            .send(http_request)
             .await
-            .map_err(|e| map_transport_send_error(e, "request failed"));
-        let _ = resp_tx.send(result);
-    });
-
-    // Enforce client-side deadline on send + parse.
-    with_deadline(deadline, async {
-        // Drain the iterator, encoding each request and pushing its envelope
-        // into the channel. The iterator is synchronous, so the only awaits
-        // here are tx.send(...), which provides backpressure via the channel
-        // depth.
-        for request in requests {
-            let msg_bytes = match config.codec_format {
-                CodecFormat::Proto => request.encode_to_bytes(),
-                CodecFormat::Json => encode_json(&request)?,
-            };
-
-            let mut envelope_buf = BytesMut::new();
-            tokio_util::codec::Encoder::encode(&mut encoder, msg_bytes, &mut envelope_buf)?;
-
-            if tx.send(Ok(envelope_buf.freeze())).await.is_err() {
-                // Receiver dropped: the spawned send task has finished, either
-                // because the transport failed or the server responded before
-                // we finished sending. Stop draining and let the response
-                // task surface the actual error/result.
-                break;
-            }
-        }
-
-        drop(tx);
-
-        // Await the response now that the request body has been fully sent.
-        let response = resp_rx.await.map_err(|_| {
-            ConnectError::internal("transport send task dropped without producing a response")
-        })??;
+            .map_err(|e| map_transport_send_error(e, "request failed"))?;
 
         // For gRPC, the response is envelope-framed like a unary gRPC response
         // (single data envelope + trailers). Reuse parse_grpc_unary_response.
@@ -3544,7 +3862,26 @@ where
             }
         }
     })
-    .await
+    .await;
+
+    // An encode failure aborts the request at the transport level; surface
+    // the precise encode error instead of the generic transport failure —
+    // unconditionally, because a server's early response can race the abort
+    // and produce an `Ok` result for a truncated, encode-aborted upload.
+    //
+    // The race runs the other way too, and that direction is left alone on
+    // purpose: with the body driven in the background, an encode failure can
+    // land after this check and is then never read, so the call reports the
+    // server's `Ok`. That is the intended outcome — the server had already
+    // produced a complete response, so the truncated tail did not affect it.
+    if let Some(err) = encode_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        return Err(err);
+    }
+    result
 }
 
 /// Parse a Connect protocol client-streaming response.
@@ -4436,6 +4773,8 @@ mod tests {
         // is typically `hyper::body::Incoming` which isn't Debug).
         assert_debug::<ServerStream<http_body_util::Empty<Bytes>, ()>>();
         assert_debug::<BidiStream<http_body_util::Empty<Bytes>, (), ()>>();
+        assert_debug::<BidiSendHalf<()>>();
+        assert_debug::<BidiRecvHalf<http_body_util::Empty<Bytes>, ()>>();
 
         // Transports — manual impls that print mode/connection state.
         #[cfg(feature = "client")]
@@ -4453,6 +4792,18 @@ mod tests {
         assert_send::<TestBidi>();
         assert_sync::<TestBidi>();
         assert_unpin::<TestBidi>();
+
+        // The halves are moved into separate spawned tasks, so their auto
+        // traits are individually load-bearing, not just via containment.
+        type TestSend = BidiSendHalf<()>;
+        type TestRecv = BidiRecvHalf<http_body_util::Empty<Bytes>, ()>;
+
+        assert_send::<TestSend>();
+        assert_sync::<TestSend>();
+        assert_unpin::<TestSend>();
+        assert_send::<TestRecv>();
+        assert_sync::<TestRecv>();
+        assert_unpin::<TestRecv>();
     }
 
     fn connect_success_body(message: &str) -> Bytes {
@@ -4480,18 +4831,23 @@ mod tests {
         buffa_types::google::protobuf::__buffa::view::StringValueView<'static>,
     > {
         BidiStream {
-            tx: None,
-            encoder: crate::envelope::EnvelopeEncoder::uncompressed(),
-            codec_format: CodecFormat::Proto,
-            recv: RecvState::AwaitingHeaders(response_task),
-            stream_config: StreamConfig {
-                protocol: Protocol::Connect,
+            send: BidiSendHalf {
+                tx: None,
+                encoder: crate::envelope::EnvelopeEncoder::uncompressed(),
                 codec_format: CodecFormat::Proto,
-                compression: CompressionRegistry::new(),
-                max_message_size: Some(1024),
                 deadline,
+                _req: PhantomData,
             },
-            _req: PhantomData,
+            recv: BidiRecvHalf {
+                recv: RecvState::AwaitingHeaders(response_task),
+                stream_config: StreamConfig {
+                    protocol: Protocol::Connect,
+                    codec_format: CodecFormat::Proto,
+                    compression: CompressionRegistry::new(),
+                    max_message_size: Some(1024),
+                    deadline,
+                },
+            },
         }
     }
 
@@ -5567,13 +5923,343 @@ mod tests {
             &config,
             "test.Service",
             "ClientStream",
-            [StringValue::from("hello")],
+            futures::stream::iter([StringValue::from("hello")]),
             CallOptions::default(),
         )
         .await
         .expect_err("transport config error must surface from client stream");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(err.message.as_deref().unwrap().contains("with_tls"));
+    }
+
+    // A transport whose `send()` future never resolves. It signals when it is
+    // first polled and again when it is dropped, so a test can assert that
+    // abandoning `call_client_stream` actually drops the in-flight transport
+    // send future rather than leaking it in a detached task.
+    #[cfg(feature = "client")]
+    #[derive(Clone)]
+    struct PendingSendTransport {
+        started: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        dropped: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    }
+
+    #[cfg(feature = "client")]
+    struct PendingSendFuture {
+        // Hold the request (and thus the stream-backed body) without ever
+        // reading it, so any request messages stay unread inside the body.
+        // Dropping this future drops the request too.
+        _request: Request<ClientBody>,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[cfg(feature = "client")]
+    impl std::future::Future for PendingSendFuture {
+        type Output = Result<Response<Full<Bytes>>, std::io::Error>;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(tx) = self.started.take() {
+                let _ = tx.send(());
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    #[cfg(feature = "client")]
+    impl Drop for PendingSendFuture {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[cfg(feature = "client")]
+    impl ClientTransport for PendingSendTransport {
+        type ResponseBody = Full<Bytes>;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            request: Request<ClientBody>,
+        ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+            // Single-shot: the streaming call paths invoke `send` exactly once.
+            // Panic loudly rather than silently swallow the started/dropped
+            // signals if that ever stops holding, which would otherwise hang the
+            // test.
+            let started = Some(
+                self.started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("PendingSendTransport::send called more than once"),
+            );
+            let dropped = Some(
+                self.dropped
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("PendingSendTransport::send called more than once"),
+            );
+            Box::pin(PendingSendFuture {
+                _request: request,
+                started,
+                dropped,
+            })
+        }
+    }
+
+    #[cfg(feature = "client")]
+    fn pending_send_transport() -> (
+        PendingSendTransport,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let transport = PendingSendTransport {
+            started: std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx))),
+            dropped: std::sync::Arc::new(std::sync::Mutex::new(Some(dropped_tx))),
+        };
+        (transport, started_rx, dropped_rx)
+    }
+
+    // When the call deadline fires while the transport is still waiting for
+    // response headers, the in-flight transport send must be dropped with the
+    // call — nothing may keep polling it.
+    #[cfg(feature = "client")]
+    #[tokio::test(start_paused = true)]
+    async fn client_stream_deadline_drops_transport_send() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (transport, started_rx, dropped_rx) = pending_send_transport();
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+
+        let mut call = Box::pin(
+            call_client_stream::<_, StringValue, StringValueView<'static>>(
+                &transport,
+                &config,
+                "test.Service",
+                "ClientStream",
+                futures::stream::empty::<StringValue>(),
+                CallOptions::default().with_timeout(Duration::from_millis(100)),
+            ),
+        );
+
+        // Drive the call until the transport send future is actually polled, so
+        // the drop we assert below is provably the deadline path abandoning an
+        // in-flight send rather than an unpolled future.
+        tokio::select! {
+            res = &mut call => panic!("call resolved before the transport was polled: {res:?}"),
+            started = started_rx => started.expect("transport send future was never polled"),
+        }
+
+        // Now let the deadline fire.
+        let err = call
+            .await
+            .expect_err("deadline must fire while the transport waits for headers");
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+
+        // The transport send future must be dropped now that the caller has
+        // stopped waiting.
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("transport send future was not dropped after the deadline fired")
+            .expect("drop signal sender vanished without firing");
+    }
+
+    // When the caller drops the `call_client_stream` future (cancellation)
+    // while the transport is still waiting for response headers, the in-flight
+    // transport send must likewise be dropped. Cancellation is a distinct path
+    // from deadline expiry — no deadline machinery fires here, so dropping the
+    // call future must stop the in-flight send on its own.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_cancellation_drops_transport_send() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (transport, started_rx, dropped_rx) = pending_send_transport();
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+
+        let mut call = Box::pin(
+            call_client_stream::<_, StringValue, StringValueView<'static>>(
+                &transport,
+                &config,
+                "test.Service",
+                "ClientStream",
+                futures::stream::empty::<StringValue>(),
+                CallOptions::default(),
+            ),
+        );
+
+        // Drive the call until the transport send future is polled, then
+        // abandon it. `call` completing here would be a bug (the transport
+        // never resolves), so treat that as a failure.
+        tokio::select! {
+            _ = &mut call => panic!("call completed though the transport never responded"),
+            started = started_rx => started.expect("transport send future was never polled"),
+        }
+        drop(call);
+
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("transport send future was not dropped after caller cancellation")
+            .expect("drop signal sender vanished without firing");
+    }
+
+    // The earlier abandonment tests use an empty request stream. This one
+    // abandons the call while the stream-backed request body still holds
+    // unsent messages — the transport holds the request but never polls the
+    // body. Proves an unfinished upload does not prevent the deadline from
+    // dropping the in-flight send.
+    #[cfg(feature = "client")]
+    #[tokio::test(start_paused = true)]
+    async fn client_stream_deadline_drops_send_with_unread_request_body() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        let (transport, started_rx, dropped_rx) = pending_send_transport();
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+
+        // Plenty of messages the transport will never pull from the body.
+        let requests: Vec<StringValue> = (0..256)
+            .map(|i| StringValue::from(format!("m{i}")))
+            .collect();
+
+        let mut call = Box::pin(
+            call_client_stream::<_, StringValue, StringValueView<'static>>(
+                &transport,
+                &config,
+                "test.Service",
+                "ClientStream",
+                stream_iter(requests),
+                CallOptions::default().with_timeout(Duration::from_millis(100)),
+            ),
+        );
+
+        // Drive the call until the transport send future is polled: by now the
+        // caller is parked mid-drain on channel backpressure.
+        tokio::select! {
+            res = &mut call => panic!("call resolved before the transport was polled: {res:?}"),
+            started = started_rx => started.expect("transport send future was never polled"),
+        }
+
+        let err = call
+            .await
+            .expect_err("deadline must fire while the upload is unfinished");
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("transport send future was not dropped despite the unread request body")
+            .expect("drop signal sender vanished without firing");
+    }
+
+    // Success path: a well-formed Connect client-streaming response decodes
+    // normally through the directly-awaited transport send.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_returns_well_formed_response() {
+        use buffa::Message;
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        #[derive(Clone)]
+        struct FixedResponseTransport {
+            body: Bytes,
+        }
+
+        impl ClientTransport for FixedResponseTransport {
+            type ResponseBody = Full<Bytes>;
+            type Error = std::io::Error;
+
+            fn send(
+                &self,
+                _request: Request<ClientBody>,
+            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+                let body = self.body.clone();
+                Box::pin(async move {
+                    let response = Response::builder()
+                        .status(http::StatusCode::OK)
+                        .header(http::header::CONTENT_TYPE, "application/connect+proto")
+                        .body(Full::new(body))
+                        .unwrap();
+                    Ok(response)
+                })
+            }
+        }
+
+        // DATA envelope carrying the response message, then an END_STREAM
+        // envelope with empty (`{}`) trailers — the Connect client-stream
+        // terminus.
+        let data =
+            crate::envelope::Envelope::data(Bytes::from(StringValue::from("ok").encode_to_vec()))
+                .encode();
+        let end = crate::envelope::Envelope::end_stream(Bytes::from_static(b"{}")).encode();
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&data);
+        body.extend_from_slice(&end);
+        let transport = FixedResponseTransport {
+            body: body.freeze(),
+        };
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+
+        let response = call_client_stream::<_, StringValue, StringValueView<'static>>(
+            &transport,
+            &config,
+            "test.Service",
+            "ClientStream",
+            stream_iter([StringValue::from("req")]),
+            CallOptions::default(),
+        )
+        .await
+        .expect("well-formed client-streaming response must decode");
+        assert_eq!(response.view().value, "ok");
+    }
+
+    // A transport send failure surfaces through the
+    // `map_transport_send_error(e, "request failed")` branch.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn client_stream_transport_send_error_still_surfaces() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+        use buffa_types::google::protobuf::StringValue;
+
+        #[derive(Clone)]
+        struct FailingTransport;
+
+        impl ClientTransport for FailingTransport {
+            type ResponseBody = Full<Bytes>;
+            type Error = std::io::Error;
+
+            fn send(
+                &self,
+                _request: Request<ClientBody>,
+            ) -> BoxFuture<'static, Result<Response<Self::ResponseBody>, Self::Error>> {
+                Box::pin(async { Err(std::io::Error::other("boom")) })
+            }
+        }
+
+        let config = ClientConfig::new("http://localhost:8080".parse().unwrap());
+        let err = call_client_stream::<_, StringValue, StringValueView<'static>>(
+            &FailingTransport,
+            &config,
+            "test.Service",
+            "ClientStream",
+            stream_iter([StringValue::from("req")]),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("transport send failure must surface");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        let message = err.message.as_deref().unwrap_or_default();
+        assert!(message.contains("request failed"), "unexpected: {message}");
+        assert!(message.contains("boom"), "unexpected: {message}");
     }
 
     #[cfg(feature = "client")]

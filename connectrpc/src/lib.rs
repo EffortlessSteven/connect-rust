@@ -212,6 +212,9 @@ pub mod service;
 pub mod spec;
 pub mod stream_message;
 
+#[cfg(test)]
+pub(crate) mod test_budget;
+
 // Optional: HTTP client
 pub mod client;
 
@@ -271,6 +274,7 @@ pub use handler::view_streaming_handler_fn;
 pub use request::HasMessageView;
 pub use request::ServiceRequest;
 pub use response::Encodable;
+pub use response::EncodedBody;
 pub use response::EncodedResponse;
 pub use response::InboundStream;
 pub use response::MaybeBorrowed;
@@ -286,6 +290,8 @@ pub use stream_message::StreamMessage;
 #[doc(hidden)]
 pub mod __codegen {
     pub use crate::response::encode_view_body;
+    pub use crate::response::encode_view_body_segments;
+    pub use crate::response::encode_view_body_with_min_segment;
 }
 
 // Error types
@@ -325,9 +331,15 @@ pub use interceptor::streaming_interceptor;
 pub use interceptor::unary_interceptor;
 
 // Client response and stream handles (what generated client methods return)
+pub use client::BidiRecvHalf;
+pub use client::BidiSendHalf;
 pub use client::BidiStream;
 pub use client::ServerStream;
 pub use client::UnaryResponse;
+
+// Request-side adapter for client-streaming calls. Re-exported at the root
+// because adapting a ready collection is the common call site.
+pub use client::stream_iter;
 
 // ============================================================================
 // Codec exports
