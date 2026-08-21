@@ -2240,43 +2240,7 @@ where
     let status = response.status();
     let resp_headers = response.headers().clone();
 
-    // grpc-go decides gRPC-ness from the content-type and then discards the
-    // HTTP status entirely; connect-go decides from the HTTP status and never
-    // reads the gRPC one. This sits between them: a non-2xx reply that is not
-    // speaking gRPC reports its HTTP status, because that is the code telling
-    // the caller whether to retry, and a `text/html` rejection would flatten
-    // every proxy failure to `unknown`.
-    //
-    // A wrong content-type is positive evidence the peer is not speaking gRPC.
-    // An absent one is not: a proxy that drops `content-type` from its local
-    // reply may still send `grpc-status`, so that reply is parsed and its
-    // trailers-only status honoured below.
-    let content_type =
-        validate_grpc_response_content_type(&resp_headers, config.protocol, config.codec_format);
-    let speaks_grpc = content_type.is_ok()
-        && (resp_headers.contains_key(http::header::CONTENT_TYPE)
-            || resp_headers.contains_key("grpc-status"));
-    if !status.is_success() && !speaks_grpc {
-        return Err(match content_type {
-            // Reuse the rejection: it already carries the response headers, and
-            // its message becomes the detail on the HTTP status.
-            Err(mut err) => {
-                let detail = err.message.take().unwrap_or_default();
-                err.code = http_status_to_error_code(status);
-                err.message = Some(format!("HTTP error {}: {detail}", status.as_u16()));
-                err
-            }
-            Ok(()) => {
-                let mut err = ConnectError::new(
-                    http_status_to_error_code(status),
-                    format!("HTTP error {}", status.as_u16()),
-                );
-                err.set_response_headers(resp_headers);
-                err
-            }
-        });
-    }
-    content_type?;
+    check_grpc_response_head(status, &resp_headers, config.protocol, config.codec_format)?;
 
     // Check for unsupported compression before reading the body
     let response_encoding = resp_headers
@@ -2572,6 +2536,58 @@ fn validate_grpc_response_content_type(
     );
     err.set_response_headers(resp_headers.clone());
     Err(err)
+}
+
+/// Gate a gRPC / gRPC-Web response on its HTTP status and `content-type`
+/// before anything reads `grpc-status`, so the unary and streaming parsers
+/// classify the same response head the same way.
+///
+/// grpc-go decides gRPC-ness from the content-type and then discards the HTTP
+/// status entirely; connect-go decides from the HTTP status and never reads
+/// the gRPC one. This sits between them: a non-2xx reply that is not speaking
+/// gRPC reports its HTTP status, because that is the code telling the caller
+/// whether to retry, and a `text/html` rejection would flatten every proxy
+/// failure to `unknown`.
+///
+/// A wrong content-type is positive evidence the peer is not speaking gRPC,
+/// so it is rejected here even when a `grpc-status` header is present. An
+/// absent one is not: a proxy that drops `content-type` from its local reply
+/// may still send `grpc-status`, so that reply passes and its trailers-only
+/// status is honoured by the caller.
+///
+/// Callers must have established a gRPC-family `protocol`; see
+/// [`validate_grpc_response_content_type`].
+fn check_grpc_response_head(
+    status: http::StatusCode,
+    resp_headers: &http::HeaderMap,
+    protocol: Protocol,
+    codec_format: CodecFormat,
+) -> Result<(), ConnectError> {
+    let content_type = validate_grpc_response_content_type(resp_headers, protocol, codec_format);
+    let speaks_grpc = content_type.is_ok()
+        && (resp_headers.contains_key(http::header::CONTENT_TYPE)
+            || resp_headers.contains_key("grpc-status"));
+    if !status.is_success() && !speaks_grpc {
+        return Err(match content_type {
+            // Reuse the rejection: it already carries the response headers, and
+            // its message becomes the detail on the HTTP status.
+            Err(mut err) => {
+                let detail = err.message.take().unwrap_or_default();
+                err.code = http_status_to_error_code(status);
+                err.message = Some(format!("HTTP error {}: {detail}", status.as_u16()));
+                err
+            }
+            Ok(()) => {
+                let mut err = ConnectError::new(
+                    http_status_to_error_code(status),
+                    format!("HTTP error {}", status.as_u16()),
+                );
+                err.set_response_headers(resp_headers.clone());
+                err
+            }
+        });
+    }
+    content_type
 }
 
 /// Terminal record for a client stream: why it ended and what trailing
@@ -3215,9 +3231,10 @@ where
 
 /// Construct a [`ServerStream`] from a streaming HTTP response.
 ///
-/// Handles trailers-only gRPC error detection, non-200 Connect error body
-/// parsing, successful gRPC-family content-type validation, and response
-/// encoding extraction. Used by both [`call_server_stream`] (passing fields
+/// Handles gRPC-family HTTP-status and content-type gating (shared with the
+/// unary path via [`check_grpc_response_head`]), trailers-only gRPC error
+/// detection, non-200 Connect error body parsing, and response encoding
+/// extraction. Used by both [`call_server_stream`] (passing fields
 /// from `&ClientConfig`) and [`BidiStream::message`] (passing fields from its
 /// owned `StreamConfig` snapshot).
 ///
@@ -3242,12 +3259,15 @@ where
     let response_headers = response.headers().clone();
     let status = response.status();
 
-    // For gRPC, check for trailers-only error response
-    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb)
-        && let Some(mut err) = parse_grpc_error_from_trailers(&response_headers)
-    {
-        err.set_response_headers(response_headers);
-        return Err(err);
+    if matches!(protocol, Protocol::Grpc | Protocol::GrpcWeb) {
+        // Same precedence as the unary path: HTTP status and content-type are
+        // settled before `grpc-status` is read, so a trailers-only reply in
+        // the wrong content-type family is rejected rather than believed.
+        check_grpc_response_head(status, &response_headers, protocol, codec_format)?;
+        if let Some(mut err) = parse_grpc_error_from_trailers(&response_headers) {
+            err.set_response_headers(response_headers);
+            return Err(err);
+        }
     }
 
     // Non-200 responses are protocol errors
@@ -3300,13 +3320,6 @@ where
         let mut err = ConnectError::new(code, format!("HTTP error {}", status.as_u16()));
         err.set_response_headers(response_headers);
         return Err(err);
-    }
-
-    match protocol {
-        Protocol::Grpc | Protocol::GrpcWeb => {
-            validate_grpc_response_content_type(&response_headers, protocol, codec_format)?;
-        }
-        Protocol::Connect => {}
     }
 
     // Get the response encoding for compressed envelopes (protocol-aware header)
@@ -5041,7 +5054,19 @@ mod tests {
                 CodecFormat::Json,
                 Some("application/grpc; charset=utf-8"),
             ),
+            (
+                Protocol::Grpc,
+                CodecFormat::Json,
+                Some("application/grpc+json"),
+            ),
             (Protocol::GrpcWeb, CodecFormat::Proto, None),
+            // Connect streaming is not content-type-gated here; a mismatch
+            // surfaces later as an end-of-stream or decode failure.
+            (
+                Protocol::Connect,
+                CodecFormat::Proto,
+                Some("application/grpc+proto"),
+            ),
         ];
 
         for (protocol, codec_format, content_type) in accepted {
@@ -5081,11 +5106,87 @@ mod tests {
         .expect_err("HTTP status must be classified before content type");
 
         assert_eq!(err.code, ErrorCode::Unavailable);
-        assert!(
-            err.message
-                .as_deref()
-                .is_some_and(|message| message.starts_with("HTTP error 502"))
+        assert_eq!(
+            err.message.as_deref(),
+            Some(
+                "HTTP error 502: unexpected content-type: text/html (expected application/grpc+proto)"
+            )
         );
+    }
+
+    /// The unary and streaming parsers see the same response head and must
+    /// classify it the same way: HTTP status and content-type are settled
+    /// before `grpc-status` is read, so a trailers-only reply in the wrong
+    /// family is rejected on its content-type rather than believed for its
+    /// status, while a proxy reply that plausibly speaks gRPC keeps its status.
+    #[tokio::test]
+    async fn unary_and_streaming_classify_a_grpc_response_head_identically() {
+        use buffa_types::google::protobuf::__buffa::view::StringValueView;
+
+        // (HTTP status, content-type, grpc-status) -> expected code
+        let cases: [(u16, Option<&str>, Option<&str>, ErrorCode); 5] = [
+            // Wrong family outranks the status it carries.
+            (
+                200,
+                Some("application/grpc-web+proto"),
+                Some("3"),
+                ErrorCode::Unknown,
+            ),
+            // Non-2xx that is not speaking gRPC reports the HTTP status.
+            (503, Some("text/html"), None, ErrorCode::Unavailable),
+            (503, None, None, ErrorCode::Unavailable),
+            // Non-2xx that plausibly speaks gRPC keeps its trailers-only status,
+            // with or without a content-type (a proxy may drop it).
+            (
+                503,
+                Some("application/grpc"),
+                Some("3"),
+                ErrorCode::InvalidArgument,
+            ),
+            (503, None, Some("3"), ErrorCode::InvalidArgument),
+        ];
+        let config =
+            ClientConfig::new("http://localhost".parse().unwrap()).with_protocol(Protocol::Grpc);
+
+        for (status, content_type, grpc_status, expected) in cases {
+            let head = || {
+                let mut b = Response::builder().status(status);
+                if let Some(ct) = content_type {
+                    b = b.header(http::header::CONTENT_TYPE, ct);
+                }
+                if let Some(gs) = grpc_status {
+                    b = b
+                        .header("grpc-status", gs)
+                        .header("grpc-message", "from the peer");
+                }
+                b.body(Full::new(Bytes::new())).unwrap()
+            };
+            let case = format!("{status} {content_type:?} {grpc_status:?}");
+
+            let streaming = make_server_stream::<_, StringValueView<'static>>(
+                head(),
+                config.protocol,
+                &config.compression,
+                config.codec_format,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err(&case);
+            let unary = parse_grpc_unary_response::<_, StringValueView<'static>>(
+                head(),
+                &config,
+                &CallOptions::default(),
+                None,
+            )
+            .await
+            .expect_err(&case);
+
+            assert_eq!(streaming.code, expected, "streaming {case}");
+            assert_eq!(unary.code, expected, "unary {case}");
+            assert_eq!(streaming.message, unary.message, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -8294,7 +8395,8 @@ mod tests {
     fn grpc_response_content_type_accepts_bare_for_json_codec() {
         // Proxies that synthesize trailers-only error replies (e.g. Envoy)
         // send bare `application/grpc` regardless of the request subtype, so
-        // the bare type must be accepted for every codec, as in connect-go.
+        // the bare type is accepted for every codec (connect-go accepts it
+        // only for proto).
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
